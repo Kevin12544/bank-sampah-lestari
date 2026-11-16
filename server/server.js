@@ -341,4 +341,5 @@ app.use((err,_req,res,_next)=>{
 });
 
 await initDb();
-app.listen(PORT,()=>console.log(`API Bank Sampah Lestari berjalan pada port ${PORT}`));
+
+export default app;

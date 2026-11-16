@@ -1,4 +1,4 @@
-# Bank Sampah Lestari — versi persiapan deploy online
+
 
 Versi ini mempertahankan antarmuka React/Vite dan mengganti backend SQLite lokal menjadi Express + PostgreSQL (Supabase). Data transaksi disimpan di PostgreSQL, bukan localStorage atau file JSON. `localStorage` pada browser hanya dipakai untuk menyimpan token login dan informasi sesi UI.
 
@@ -97,3 +97,5 @@ Password disimpan dalam bentuk hash bcrypt. Untuk demo publik, set `DEMO_PASSWOR
 - Akun Nasabah demo ditautkan ke data nasabah Andi Pratama. Nasabah baru yang ditambahkan dari menu Data Nasabah belum otomatis memperoleh akun login.
 - `DEMO_PASSWORD` hanya digunakan ketika seed akun dibuat pertama kali. Mengubah environment variable setelah akun terbentuk tidak mengganti password akun yang sudah ada.
 - Uji seluruh alur transaksi setelah deploy. Untuk penggunaan nyata, tambahkan proses ganti password, pemulihan akun, audit log, backup, dan pengaturan keamanan lebih lanjut.
+=======
+

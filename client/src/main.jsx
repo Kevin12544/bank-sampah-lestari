@@ -2,7 +2,7 @@ import React,{useEffect,useMemo,useState} from 'react';
 import{createRoot}from'react-dom/client';
 import{LayoutDashboard,Recycle,Wallet,Users,Scale,ArrowDownToLine,ShoppingCart,FileText,Bell,LogOut,Menu,Search,Plus,Printer,Leaf,TrendingUp,ChevronDown,CheckCircle2,AlertCircle}from'lucide-react';
 import './style.css';
-const API=(import.meta.env.VITE_API_URL||'http://localhost:4000/api').replace(/\/$/,'');
+const API=(import.meta.env.VITE_API_URL||'/api').replace(/\/$/,'');
 const fmt=n=>'Rp '+Number(n||0).toLocaleString('id-ID');
 const dateNow=()=>new Date().toISOString().slice(0,10);
 function App(){

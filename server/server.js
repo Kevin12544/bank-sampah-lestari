@@ -5,6 +5,8 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import pg from "pg";
 import dotenv from "dotenv";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 
 dotenv.config();
 const { Pool } = pg;
@@ -340,5 +342,44 @@ app.use((err,_req,res,_next)=>{
   res.status(500).json({error:"Terjadi kesalahan pada server. Periksa log backend."});
 });
 
-await initDb();
-app.listen(PORT,()=>console.log(`API Bank Sampah Lestari berjalan pada port ${PORT}`));
+const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+async function startServer() {
+  try {
+    await initDb();
+    app.listen(PORT, () => console.log(`Server Bank Sampah Lestari berjalan di http://localhost:${PORT}`));
+  } catch (error) {
+    console.error("Gagal menjalankan server:", error);
+    process.exit(1);
+  }
+}
+
+let dbInitPromise;
+
+async function ensureDb() {
+  if (!dbInitPromise) {
+    dbInitPromise = initDb().catch((error) => {
+      dbInitPromise = null;
+      throw error;
+    });
+  }
+
+  return dbInitPromise;
+}
+
+if (isDirectRun) {
+  startServer();
+}
+
+export default async function handler(req, res) {
+  try {
+    await ensureDb();
+    return app(req, res);
+  } catch (error) {
+    console.error("Gagal menginisialisasi database:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Database belum dapat diinisialisasi."
+    });
+  }
+}

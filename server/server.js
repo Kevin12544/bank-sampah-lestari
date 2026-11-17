@@ -342,6 +342,7 @@ app.use((err,_req,res,_next)=>{
   res.status(500).json({error:"Terjadi kesalahan pada server. Periksa log backend."});
 });
 
+
 const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 async function startServer() {
@@ -383,3 +384,4 @@ export default async function handler(req, res) {
     });
   }
 }
+

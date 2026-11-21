@@ -1,3 +1,4 @@
+
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
@@ -30,12 +31,18 @@ const fmtDate = (value) => {
 };
 
 const dateNow = () => {
-  const now = new Date();
-  const localDate = new Date(
-    now.getTime() - now.getTimezoneOffset() * 60000
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Makassar',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+
+  const values = Object.fromEntries(
+    parts.map((part) => [part.type, part.value])
   );
 
-  return localDate.toISOString().slice(0, 10);
+  return `${values.year}-${values.month}-${values.day}`;
 };
 
 function App() {
@@ -64,21 +71,33 @@ function App() {
   const toastTimerRef = useRef(null);
 
   async function api(path, opts = {}) {
-    const response = await fetch(API + path, {
-      ...opts,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(token ? { Authorization: 'Bearer ' + token } : {}),
-        ...(opts.headers || {}),
-      },
-    });
+    let response;
+
+    try {
+      response = await fetch(API + path, {
+        ...opts,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: 'Bearer ' + token } : {}),
+          ...(opts.headers || {}),
+        },
+      });
+    } catch (error) {
+      console.error('API connection error:', error);
+
+      throw new Error(
+        'Tidak dapat terhubung ke server. Periksa koneksi backend, URL API, dan konfigurasi CORS.'
+      );
+    }
 
     let result;
 
     try {
       result = await response.json();
     } catch {
-      throw new Error('Server memberikan respons yang tidak valid.');
+      throw new Error(
+        'Server memberikan respons yang tidak valid. Periksa log backend.'
+      );
     }
 
     if (!response.ok) {
@@ -87,7 +106,8 @@ function App() {
       }
 
       throw new Error(
-        result?.error || 'Terjadi kesalahan saat menghubungi server.'
+        result?.error ||
+        `Permintaan gagal. Kode server: ${response.status}`
       );
     }
 
@@ -814,8 +834,11 @@ function Table({ headers, rows }) {
 
 function Harga({ data, api, message, reload }) {
   const [values, setValues] = useState({});
+  const [savingId, setSavingId] = useState(null);
 
   async function save(id, current) {
+    if (savingId !== null) return;
+
     const value = values[id] ?? current;
 
     if (
@@ -827,8 +850,10 @@ function Harga({ data, api, message, reload }) {
       return;
     }
 
+    setSavingId(id);
+
     try {
-      await api('/harga/' + id, {
+      await api('/harga/' + encodeURIComponent(id), {
         method: 'PUT',
         body: JSON.stringify({
           harga_per_kg: Number(value),
@@ -836,9 +861,19 @@ function Harga({ data, api, message, reload }) {
       });
 
       message('Harga sampah berhasil diperbarui.');
+
+      setValues((previous) => {
+        const updated = { ...previous };
+        delete updated[id];
+        return updated;
+      });
+
       await reload();
     } catch (error) {
+      console.error('Gagal memperbarui harga:', error);
       message(error.message);
+    } finally {
+      setSavingId(null);
     }
   }
 
@@ -869,23 +904,25 @@ function Harga({ data, api, message, reload }) {
               <input
                 type="number"
                 min="0"
+                step="1"
                 value={values[item.id_harga] ?? item.harga_per_kg}
                 onChange={(e) =>
-                  setValues({
-                    ...values,
+                  setValues((previous) => ({
+                    ...previous,
                     [item.id_harga]: e.target.value,
-                  })
+                  }))
                 }
               />
             </div>,
             fmtDate(item.tgl_mulai),
             <button
               className="small-primary"
+              disabled={savingId !== null}
               onClick={() =>
                 save(item.id_harga, item.harga_per_kg)
               }
             >
-              Simpan
+              {savingId === item.id_harga ? 'Menyimpan...' : 'Simpan'}
             </button>,
           ])}
         />

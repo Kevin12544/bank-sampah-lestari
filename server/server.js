@@ -49,20 +49,52 @@ const allowedOrigins = [
     .filter(Boolean)
 ];
 
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+
+  const normalizedOrigin = origin.replace(/\/$/, "");
+
+  if (allowedOrigins.includes(normalizedOrigin)) {
+    return true;
+  }
+
+  // Izinkan deployment preview Cloudflare Pages
+  if (
+    /^https:\/\/[a-z0-9-]+\.bank-sampah-lestari\.pages\.dev$/i.test(
+      normalizedOrigin
+    )
+  ) {
+    return true;
+  }
+
+  // Izinkan development lokal
+  if (
+    /^http:\/\/localhost:(5173|4173|3000)$/i.test(
+      normalizedOrigin
+    )
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 app.use(
   cors({
     origin(origin, callback) {
-      if (
-        !origin ||
-        allowedOrigins.includes(origin.replace(/\/$/, ""))
-      ) {
+      if (isAllowedOrigin(origin)) {
         return callback(null, true);
       }
+
+      console.error("CORS blocked origin:", origin);
 
       return callback(
         new Error("Origin tidak diizinkan oleh CORS.")
       );
-    }
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    optionsSuccessStatus: 204
   })
 );
 
@@ -583,7 +615,14 @@ app.put(
   auth,
   allow("Ketua", "Bendahara"),
   async (req, res) => {
+    const id = req.params.id;
     const priceValue = req.body?.harga_per_kg;
+
+    if (!/^\d+$/.test(id)) {
+      return res.status(400).json({
+        error: "ID harga tidak valid."
+      });
+    }
 
     if (!validNumber(priceValue) || Number(priceValue) < 0) {
       return res.status(400).json({
@@ -591,21 +630,31 @@ app.put(
       });
     }
 
-    const result = await q(
-      `UPDATE harga_sampah
-       SET harga_per_kg=$1,tgl_mulai=CURRENT_DATE
-       WHERE id_harga=$2
-       RETURNING id_harga`,
-      [Number(priceValue), req.params.id]
-    );
+    try {
+      const result = await q(
+        `UPDATE harga_sampah
+         SET harga_per_kg=$1,
+             tgl_mulai=CURRENT_DATE
+         WHERE id_harga=$2
+         RETURNING id_harga,jenis_sampah,harga_per_kg,tgl_mulai`,
+        [Number(priceValue), id]
+      );
 
-    if (!result.length) {
-      return res.status(404).json({
-        error: "Data harga sampah tidak ditemukan."
+      if (!result.length) {
+        return res.status(404).json({
+          error: "Data harga sampah tidak ditemukan."
+        });
+      }
+
+      return res.json({
+        ok: true,
+        message: "Harga sampah berhasil diperbarui.",
+        data: result[0]
       });
+    } catch (error) {
+      console.error("Gagal memperbarui harga sampah:", error);
+      throw error;
     }
-
-    res.json({ ok: true });
   }
 );
 

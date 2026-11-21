@@ -1,3 +1,4 @@
+
 import "express-async-errors";
 import express from "express";
 import cors from "cors";
@@ -25,12 +26,17 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_SSL === "false"
-    ? false
-    : { rejectUnauthorized: false },
+  ssl:
+    process.env.DATABASE_SSL === "false"
+      ? false
+      : { rejectUnauthorized: false },
   max: 5,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000
+});
+
+pool.on("error", error => {
+  console.error("Database pool error:", error);
 });
 
 // CORS
@@ -43,15 +49,22 @@ const allowedOrigins = [
     .filter(Boolean)
 ];
 
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin.replace(/\/$/, ""))) {
-      return callback(null, true);
-    }
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (
+        !origin ||
+        allowedOrigins.includes(origin.replace(/\/$/, ""))
+      ) {
+        return callback(null, true);
+      }
 
-    return callback(new Error("Origin tidak diizinkan oleh CORS."));
-  }
-}));
+      return callback(
+        new Error("Origin tidak diizinkan oleh CORS.")
+      );
+    }
+  })
+);
 
 app.use(express.json({ limit: "1mb" }));
 
@@ -62,9 +75,34 @@ const q = async (sql, params = []) =>
 const one = async (sql, params = []) =>
   (await q(sql, params))[0] || null;
 
-const num = n => Number(n || 0);
+const num = value => {
+  const result = Number(value);
+  return Number.isFinite(result) ? result : 0;
+};
 
-const today = () => new Date().toISOString().slice(0, 10);
+const validNumber = value =>
+  value !== null &&
+  value !== undefined &&
+  value !== "" &&
+  Number.isFinite(Number(value));
+
+const today = () =>
+  new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Makassar",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date());
+
+const validDate = value =>
+  !value ||
+  (
+    /^\d{4}-\d{2}-\d{2}$/.test(value) &&
+    !Number.isNaN(Date.parse(`${value}T00:00:00Z`))
+  );
+
+const formatRupiah = value =>
+  num(value).toLocaleString("id-ID");
 
 async function initDb() {
   await pool.query(`
@@ -162,6 +200,7 @@ async function initDb() {
     );
   `);
 
+  // AKUN DEMO
   const userCount = Number(
     (await one("SELECT COUNT(*)::int AS n FROM users")).n
   );
@@ -182,12 +221,14 @@ async function initDb() {
 
       await q(
         `INSERT INTO users(username,password,role,nama_user)
-         VALUES($1,$2,$3,$4)`,
+         VALUES($1,$2,$3,$4)
+         ON CONFLICT(username) DO NOTHING`,
         [username, hash, role, nama_user]
       );
     }
   }
 
+  // HARGA AWAL
   const priceCount = Number(
     (await one("SELECT COUNT(*)::int AS n FROM harga_sampah")).n
   );
@@ -207,13 +248,17 @@ async function initDb() {
       await q(
         `INSERT INTO harga_sampah
          (jenis_sampah,harga_per_kg,tgl_mulai)
-         VALUES($1,$2,CURRENT_DATE)`,
+         VALUES($1,$2,CURRENT_DATE)
+         ON CONFLICT(jenis_sampah) DO NOTHING`,
         [jenis, harga]
       );
     }
   }
 
-  const ketua = await one("SELECT id_ketua FROM ketua LIMIT 1");
+  // DATA KETUA
+  const ketua = await one(
+    "SELECT id_ketua FROM ketua LIMIT 1"
+  );
 
   if (!ketua) {
     await q(
@@ -222,6 +267,7 @@ async function initDb() {
     );
   }
 
+  // DATA NASABAH AWAL
   const customerCount = Number(
     (await one("SELECT COUNT(*)::int AS n FROM nasabah")).n
   );
@@ -231,35 +277,41 @@ async function initDb() {
       "SELECT id_user FROM users WHERE username='nasabah'"
     );
 
-    await q(
-      `INSERT INTO nasabah
-       (id_user,no_buku,nama,alamat,no_hp,saldo)
-       VALUES($1,$2,$3,$4,$5,$6)`,
-      [
-        u.id_user,
-        "NSB-001",
-        "Andi Pratama",
-        "Manado",
-        "081234567890",
-        248000
-      ]
-    );
+    if (u) {
+      await q(
+        `INSERT INTO nasabah
+         (id_user,no_buku,nama,alamat,no_hp,saldo)
+         VALUES($1,$2,$3,$4,$5,$6)
+         ON CONFLICT(no_buku) DO NOTHING`,
+        [
+          u.id_user,
+          "NSB-001",
+          "Andi Pratama",
+          "Manado",
+          "081234567890",
+          248000
+        ]
+      );
+    }
 
     await q(
       `INSERT INTO nasabah
        (no_buku,nama,alamat,no_hp,saldo)
-       VALUES($1,$2,$3,$4,$5)`,
+       VALUES($1,$2,$3,$4,$5)
+       ON CONFLICT(no_buku) DO NOTHING`,
       ["NSB-002", "Siti Lestari", "Manado", "081298765432", 175000]
     );
 
     await q(
       `INSERT INTO nasabah
        (no_buku,nama,alamat,no_hp,saldo)
-       VALUES($1,$2,$3,$4,$5)`,
+       VALUES($1,$2,$3,$4,$5)
+       ON CONFLICT(no_buku) DO NOTHING`,
       ["NSB-003", "Budi Santoso", "Minahasa", "081277788899", 92000]
     );
   }
 
+  // DATA SETORAN AWAL
   const setorCount = Number(
     (await one("SELECT COUNT(*)::int AS n FROM transaksi_setor")).n
   );
@@ -274,14 +326,18 @@ async function initDb() {
        FROM harga_sampah WHERE jenis_sampah='Plastik'`
     );
 
-    await q(
-      `INSERT INTO transaksi_setor
-       (id_nasabah,id_harga,tanggal,jenis_sampah,
-        berat_awal,harga,nilai_setor,petugas)
-       VALUES($1,$2,CURRENT_DATE,'Plastik',25,$3,75000,'Petugas Timbang')`,
-      [n.id_nasabah, h.id_harga, h.harga_per_kg]
-    );
+    if (n && h) {
+      await q(
+        `INSERT INTO transaksi_setor
+         (id_nasabah,id_harga,tanggal,jenis_sampah,
+          berat_awal,harga,nilai_setor,petugas)
+         VALUES($1,$2,CURRENT_DATE,'Plastik',25,$3,75000,'Petugas Timbang')`,
+        [n.id_nasabah, h.id_harga, h.harga_per_kg]
+      );
+    }
   }
+
+  console.log("Database Bank Sampah Lestari siap.");
 }
 
 // AUTHENTICATION
@@ -331,7 +387,9 @@ app.get("/api/health", async (_req, res) => {
       app: "Bank Sampah Lestari",
       database: "connected"
     });
-  } catch {
+  } catch (error) {
+    console.error("Health check error:", error);
+
     res.status(503).json({
       ok: false,
       database: "disconnected"
@@ -343,7 +401,12 @@ app.get("/api/health", async (_req, res) => {
 app.post("/api/login", async (req, res) => {
   const { username, password } = req.body || {};
 
-  if (!username || !password) {
+  if (
+    typeof username !== "string" ||
+    typeof password !== "string" ||
+    !username.trim() ||
+    !password
+  ) {
     return res.status(400).json({
       error: "Username dan password wajib diisi."
     });
@@ -352,7 +415,7 @@ app.post("/api/login", async (req, res) => {
   const user = await one(
     `SELECT id_user,username,password,role,nama_user
      FROM users WHERE username=$1`,
-    [username]
+    [username.trim()]
   );
 
   if (!user || !(await bcrypt.compare(password, user.password))) {
@@ -372,7 +435,10 @@ app.post("/api/login", async (req, res) => {
     expiresIn: "8h"
   });
 
-  res.json({ token, user: safeUser });
+  res.json({
+    token,
+    user: safeUser
+  });
 });
 
 app.get("/api/me", auth, (req, res) => {
@@ -385,37 +451,54 @@ app.get(
   auth,
   allow("Ketua", "Bendahara", "Petugas Timbang"),
   async (_req, res) => {
-    const nasabah = await one(
-      "SELECT COUNT(*)::int AS total FROM nasabah"
-    );
+    const [
+      nasabah,
+      setor,
+      penjualan,
+      penarikan,
+      recent,
+      chart
+    ] = await Promise.all([
+      one(
+        "SELECT COUNT(*)::int AS total FROM nasabah"
+      ),
 
-    const setor = await one(
-      "SELECT COALESCE(SUM(nilai_setor),0) AS total FROM transaksi_setor"
-    );
+      one(
+        "SELECT COALESCE(SUM(nilai_setor),0) AS total FROM transaksi_setor"
+      ),
 
-    const penjualan = await one(
-      "SELECT COALESCE(SUM(total),0) AS total FROM transaksi_penjualan"
-    );
+      one(
+        "SELECT COALESCE(SUM(total),0) AS total FROM transaksi_penjualan"
+      ),
 
-    const penarikan = await one(
-      "SELECT COALESCE(SUM(jumlah),0) AS total FROM transaksi_penarikan"
-    );
+      one(
+        "SELECT COALESCE(SUM(jumlah),0) AS total FROM transaksi_penarikan"
+      ),
 
-    const recent = await q(`
-      SELECT t.id_setor AS id,t.tanggal,t.jenis_sampah,
-      t.berat_awal AS berat,t.nilai_setor AS nilai,
-      n.nama,'Setoran' AS tipe
-      FROM transaksi_setor t
-      JOIN nasabah n ON n.id_nasabah=t.id_nasabah
-      ORDER BY t.id_setor DESC LIMIT 6
-    `);
+      q(`
+        SELECT
+          t.id_setor AS id,
+          t.tanggal,
+          t.jenis_sampah,
+          t.berat_awal AS berat,
+          t.nilai_setor AS nilai,
+          n.nama,
+          'Setoran' AS tipe
+        FROM transaksi_setor t
+        JOIN nasabah n
+          ON n.id_nasabah=t.id_nasabah
+        ORDER BY t.id_setor DESC
+        LIMIT 6
+      `),
 
-    const chart = await q(`
-      SELECT jenis_sampah AS jenis,
-      SUM(berat_awal) AS berat
-      FROM transaksi_setor
-      GROUP BY jenis_sampah
-    `);
+      q(`
+        SELECT
+          jenis_sampah AS jenis,
+          SUM(berat_awal) AS berat
+        FROM transaksi_setor
+        GROUP BY jenis_sampah
+      `)
+    ]);
 
     res.json({
       nasabah: nasabah.total,
@@ -436,7 +519,9 @@ app.get(
   allow("Ketua", "Bendahara", "Petugas Timbang"),
   async (_req, res) => {
     res.json(
-      await q("SELECT * FROM nasabah ORDER BY id_nasabah DESC")
+      await q(
+        "SELECT * FROM nasabah ORDER BY id_nasabah DESC"
+      )
     );
   }
 );
@@ -448,7 +533,12 @@ app.post(
   async (req, res) => {
     const { no_buku, nama, alamat, no_hp } = req.body || {};
 
-    if (!no_buku || !nama) {
+    if (
+      typeof no_buku !== "string" ||
+      typeof nama !== "string" ||
+      !no_buku.trim() ||
+      !nama.trim()
+    ) {
       return res.status(400).json({
         error: "Nomor buku dan nama wajib diisi."
       });
@@ -458,18 +548,23 @@ app.post(
       await q(
         `INSERT INTO nasabah(no_buku,nama,alamat,no_hp)
          VALUES($1,$2,$3,$4)`,
-        [no_buku, nama, alamat || "", no_hp || ""]
+        [
+          no_buku.trim(),
+          nama.trim(),
+          alamat || "",
+          no_hp || ""
+        ]
       );
 
       res.json({ ok: true });
-    } catch (e) {
-      if (e.code === "23505") {
+    } catch (error) {
+      if (error.code === "23505") {
         return res.status(400).json({
           error: "Nomor buku sudah digunakan."
         });
       }
 
-      throw e;
+      throw error;
     }
   }
 );
@@ -477,7 +572,9 @@ app.post(
 // HARGA SAMPAH
 app.get("/api/harga", auth, async (_req, res) => {
   res.json(
-    await q("SELECT * FROM harga_sampah ORDER BY id_harga")
+    await q(
+      "SELECT * FROM harga_sampah ORDER BY id_harga"
+    )
   );
 });
 
@@ -486,20 +583,27 @@ app.put(
   auth,
   allow("Ketua", "Bendahara"),
   async (req, res) => {
-    const price = num(req.body?.harga_per_kg);
+    const priceValue = req.body?.harga_per_kg;
 
-    if (!Number.isFinite(price) || price < 0) {
+    if (!validNumber(priceValue) || Number(priceValue) < 0) {
       return res.status(400).json({
         error: "Harga tidak valid."
       });
     }
 
-    await q(
+    const result = await q(
       `UPDATE harga_sampah
        SET harga_per_kg=$1,tgl_mulai=CURRENT_DATE
-       WHERE id_harga=$2`,
-      [price, req.params.id]
+       WHERE id_harga=$2
+       RETURNING id_harga`,
+      [Number(priceValue), req.params.id]
     );
+
+    if (!result.length) {
+      return res.status(404).json({
+        error: "Data harga sampah tidak ditemukan."
+      });
+    }
 
     res.json({ ok: true });
   }
@@ -516,10 +620,53 @@ app.post(
     if (
       !id_nasabah ||
       !Array.isArray(items) ||
-      !items.some(x => num(x.berat) > 0)
+      !items.length ||
+      !validDate(tanggal)
     ) {
       return res.status(400).json({
-        error: "Pilih nasabah dan masukkan minimal satu berat sampah."
+        error: "Data setoran tidak valid."
+      });
+    }
+
+    const validItems = [];
+
+    for (const item of items) {
+      const beratInput = item?.berat;
+
+      if (!validNumber(beratInput)) {
+        return res.status(400).json({
+          error: "Berat sampah harus berupa angka yang valid."
+        });
+      }
+
+      const berat = Number(beratInput);
+
+      if (berat < 0) {
+        return res.status(400).json({
+          error: "Berat sampah tidak boleh negatif."
+        });
+      }
+
+      if (berat === 0) continue;
+
+      if (
+        typeof item?.jenis !== "string" ||
+        !item.jenis.trim()
+      ) {
+        return res.status(400).json({
+          error: "Jenis sampah wajib dipilih."
+        });
+      }
+
+      validItems.push({
+        jenis: item.jenis.trim(),
+        berat
+      });
+    }
+
+    if (!validItems.length) {
+      return res.status(400).json({
+        error: "Masukkan minimal satu berat sampah."
       });
     }
 
@@ -528,12 +675,15 @@ app.post(
     try {
       await client.query("BEGIN");
 
-      const customer = (
-        await client.query(
-          "SELECT * FROM nasabah WHERE id_nasabah=$1 FOR UPDATE",
-          [id_nasabah]
-        )
-      ).rows[0];
+      const customerResult = await client.query(
+        `SELECT *
+         FROM nasabah
+         WHERE id_nasabah=$1
+         FOR UPDATE`,
+        [id_nasabah]
+      );
+
+      const customer = customerResult.rows[0];
 
       if (!customer) {
         await client.query("ROLLBACK");
@@ -544,37 +694,56 @@ app.post(
       }
 
       let total = 0;
+      const transactionDate = tanggal || today();
 
-      for (const item of items) {
-        const berat = num(item.berat);
+      for (const item of validItems) {
+        const priceResult = await client.query(
+          `SELECT id_harga,harga_per_kg
+           FROM harga_sampah
+           WHERE jenis_sampah=$1`,
+          [item.jenis]
+        );
 
-        if (berat <= 0) continue;
+        const price = priceResult.rows[0];
 
-        const price = (
-          await client.query(
-            `SELECT id_harga,harga_per_kg
-             FROM harga_sampah WHERE jenis_sampah=$1`,
-            [item.jenis]
-          )
-        ).rows[0];
+        if (!price) {
+          throw new Error(
+            `Harga untuk jenis sampah "${item.jenis}" belum tersedia.`
+          );
+        }
 
-        if (!price) continue;
+        const harga = Number(price.harga_per_kg);
+        const value = item.berat * harga;
 
-        const value = berat * num(price.harga_per_kg);
+        if (
+          !Number.isFinite(value) ||
+          !Number.isFinite(total + value)
+        ) {
+          throw new Error("Perhitungan nilai setoran tidak valid.");
+        }
+
         total += value;
 
         await client.query(
           `INSERT INTO transaksi_setor
-           (id_nasabah,id_harga,tanggal,jenis_sampah,
-            berat_awal,harga,nilai_setor,petugas)
+           (
+             id_nasabah,
+             id_harga,
+             tanggal,
+             jenis_sampah,
+             berat_awal,
+             harga,
+             nilai_setor,
+             petugas
+           )
            VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
           [
             id_nasabah,
             price.id_harga,
-            tanggal || today(),
+            transactionDate,
             item.jenis,
-            berat,
-            price.harga_per_kg,
+            item.berat,
+            harga,
             value,
             req.user.nama_user
           ]
@@ -582,24 +751,40 @@ app.post(
       }
 
       await client.query(
-        "UPDATE nasabah SET saldo=saldo+$1 WHERE id_nasabah=$2",
+        `UPDATE nasabah
+         SET saldo=saldo+$1
+         WHERE id_nasabah=$2`,
         [total, id_nasabah]
       );
 
       await client.query(
-        "INSERT INTO notifications(message,type) VALUES($1,$2)",
+        `INSERT INTO notifications(message,type)
+         VALUES($1,$2)`,
         [
-          `Setoran berhasil untuk ${customer.nama}. Saldo bertambah Rp ${total.toLocaleString("id-ID")}`,
+          `Setoran berhasil untuk ${customer.nama}. Saldo bertambah Rp ${formatRupiah(total)}`,
           "success"
         ]
       );
 
       await client.query("COMMIT");
 
-      res.json({ ok: true, total });
-    } catch (e) {
+      res.json({
+        ok: true,
+        total
+      });
+    } catch (error) {
       await client.query("ROLLBACK");
-      throw e;
+
+      if (
+        error.message?.startsWith("Harga untuk jenis sampah") ||
+        error.message === "Perhitungan nilai setoran tidak valid."
+      ) {
+        return res.status(400).json({
+          error: error.message
+        });
+      }
+
+      throw error;
     } finally {
       client.release();
     }
@@ -613,13 +798,16 @@ app.post(
   allow("Ketua", "Bendahara"),
   async (req, res) => {
     const { id_nasabah, jumlah, keterangan } = req.body || {};
-    const amount = num(jumlah);
 
-    if (
-      !id_nasabah ||
-      !Number.isFinite(amount) ||
-      amount <= 0
-    ) {
+    if (!validNumber(jumlah)) {
+      return res.status(400).json({
+        error: "Jumlah penarikan tidak valid."
+      });
+    }
+
+    const amount = Number(jumlah);
+
+    if (!id_nasabah || amount <= 0) {
       return res.status(400).json({
         error: "Data penarikan tidak valid."
       });
@@ -630,18 +818,21 @@ app.post(
     try {
       await client.query("BEGIN");
 
-      const customer = (
-        await client.query(
-          "SELECT * FROM nasabah WHERE id_nasabah=$1 FOR UPDATE",
-          [id_nasabah]
-        )
-      ).rows[0];
+      const customerResult = await client.query(
+        `SELECT *
+         FROM nasabah
+         WHERE id_nasabah=$1
+         FOR UPDATE`,
+        [id_nasabah]
+      );
+
+      const customer = customerResult.rows[0];
 
       if (!customer) {
         await client.query("ROLLBACK");
 
-        return res.status(400).json({
-          error: "Data penarikan tidak valid."
+        return res.status(404).json({
+          error: "Nasabah tidak ditemukan."
         });
       }
 
@@ -667,14 +858,17 @@ app.post(
       );
 
       await client.query(
-        "UPDATE nasabah SET saldo=saldo-$1 WHERE id_nasabah=$2",
+        `UPDATE nasabah
+         SET saldo=saldo-$1
+         WHERE id_nasabah=$2`,
         [amount, id_nasabah]
       );
 
       await client.query(
-        "INSERT INTO notifications(message,type) VALUES($1,$2)",
+        `INSERT INTO notifications(message,type)
+         VALUES($1,$2)`,
         [
-          `Penarikan berhasil untuk ${customer.nama}: Rp ${amount.toLocaleString("id-ID")}`,
+          `Penarikan berhasil untuk ${customer.nama}: Rp ${formatRupiah(amount)}`,
           "success"
         ]
       );
@@ -682,9 +876,9 @@ app.post(
       await client.query("COMMIT");
 
       res.json({ ok: true });
-    } catch (e) {
+    } catch (error) {
       await client.query("ROLLBACK");
-      throw e;
+      throw error;
     } finally {
       client.release();
     }
@@ -699,10 +893,12 @@ app.get(
   async (_req, res) => {
     res.json(
       await q(`
-        SELECT p.*,g.nama AS nama_pengepul
+        SELECT
+          p.*,
+          g.nama AS nama_pengepul
         FROM transaksi_penjualan p
         LEFT JOIN pengepul g
-        ON g.id_pengepul=p.id_pengepul
+          ON g.id_pengepul=p.id_pengepul
         ORDER BY p.id_penjualan DESC
       `)
     );
@@ -716,7 +912,9 @@ app.get(
   allow("Ketua", "Bendahara"),
   async (_req, res) => {
     res.json(
-      await q("SELECT * FROM pengepul ORDER BY nama")
+      await q(
+        "SELECT * FROM pengepul ORDER BY nama"
+      )
     );
   }
 );
@@ -728,15 +926,23 @@ app.post(
   async (req, res) => {
     const { nama, kontak, alamat } = req.body || {};
 
-    if (!nama) {
+    if (
+      typeof nama !== "string" ||
+      !nama.trim()
+    ) {
       return res.status(400).json({
         error: "Nama pengepul wajib diisi."
       });
     }
 
     await q(
-      "INSERT INTO pengepul(nama,kontak,alamat) VALUES($1,$2,$3)",
-      [nama, kontak || "", alamat || ""]
+      `INSERT INTO pengepul(nama,kontak,alamat)
+       VALUES($1,$2,$3)`,
+      [
+        nama.trim(),
+        kontak || "",
+        alamat || ""
+      ]
     );
 
     res.json({ ok: true });
@@ -756,38 +962,97 @@ app.post(
       pembeli
     } = req.body || {};
 
-    const berat = num(berat_jual);
-    const harga = num(harga_jual);
-
-    if (!jenis_sampah || berat <= 0 || harga <= 0) {
+    if (
+      typeof jenis_sampah !== "string" ||
+      !jenis_sampah.trim() ||
+      !validNumber(berat_jual) ||
+      !validNumber(harga_jual)
+    ) {
       return res.status(400).json({
         error: "Lengkapi jenis sampah, berat, dan harga jual."
       });
     }
 
+    const berat = Number(berat_jual);
+    const harga = Number(harga_jual);
+
+    if (berat <= 0 || harga <= 0) {
+      return res.status(400).json({
+        error: "Berat dan harga jual harus lebih dari nol."
+      });
+    }
+
     const total = berat * harga;
 
-    await q(
-      `INSERT INTO transaksi_penjualan
-       (id_pengepul,tanggal,jenis_sampah,
-        berat_jual,harga_jual,total,pembeli)
-       VALUES($1,CURRENT_DATE,$2,$3,$4,$5,$6)`,
-      [
-        id_pengepul || null,
-        jenis_sampah,
-        berat,
-        harga,
-        total,
-        pembeli || ""
-      ]
-    );
+    if (!Number.isFinite(total)) {
+      return res.status(400).json({
+        error: "Total penjualan tidak valid."
+      });
+    }
 
-    await notify(
-      `Penjualan ${berat} kg ${jenis_sampah} berhasil dicatat.`,
-      "success"
-    );
+    const client = await pool.connect();
 
-    res.json({ ok: true, total });
+    try {
+      await client.query("BEGIN");
+
+      if (id_pengepul) {
+        const pengepulResult = await client.query(
+          "SELECT id_pengepul FROM pengepul WHERE id_pengepul=$1",
+          [id_pengepul]
+        );
+
+        if (!pengepulResult.rows.length) {
+          await client.query("ROLLBACK");
+
+          return res.status(400).json({
+            error: "Pengepul tidak ditemukan."
+          });
+        }
+      }
+
+      await client.query(
+        `INSERT INTO transaksi_penjualan
+         (
+           id_pengepul,
+           tanggal,
+           jenis_sampah,
+           berat_jual,
+           harga_jual,
+           total,
+           pembeli
+         )
+         VALUES($1,CURRENT_DATE,$2,$3,$4,$5,$6)`,
+        [
+          id_pengepul || null,
+          jenis_sampah.trim(),
+          berat,
+          harga,
+          total,
+          pembeli || ""
+        ]
+      );
+
+      await client.query(
+        `INSERT INTO notifications(message,type)
+         VALUES($1,$2)`,
+        [
+          `Penjualan ${berat} kg ${jenis_sampah.trim()} berhasil dicatat.`,
+          "success"
+        ]
+      );
+
+      await client.query("COMMIT");
+
+      res.json({
+        ok: true,
+        total
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 );
 
@@ -797,12 +1062,22 @@ app.get(
   auth,
   allow("Ketua", "Bendahara"),
   async (req, res) => {
-    const month = Math.min(
-      12,
-      Math.max(1, Number(req.query.month) || new Date().getMonth() + 1)
-    );
+    const monthValue = Number(req.query.month);
+    const yearValue = Number(req.query.year);
 
-    const year = Number(req.query.year) || new Date().getFullYear();
+    const month =
+      Number.isInteger(monthValue) &&
+      monthValue >= 1 &&
+      monthValue <= 12
+        ? monthValue
+        : new Date().getMonth() + 1;
+
+    const year =
+      Number.isInteger(yearValue) &&
+      yearValue >= 2000 &&
+      yearValue <= 2100
+        ? yearValue
+        : new Date().getFullYear();
 
     const start =
       `${year}-${String(month).padStart(2, "0")}-01`;
@@ -813,29 +1088,35 @@ app.get(
 
     const [setor, tarik, jual, detail] = await Promise.all([
       one(
-        `SELECT COALESCE(SUM(nilai_setor),0) AS total,
-         COALESCE(SUM(berat_awal),0) AS berat
-         FROM transaksi_setor WHERE tanggal BETWEEN $1 AND $2`,
+        `SELECT
+           COALESCE(SUM(nilai_setor),0) AS total,
+           COALESCE(SUM(berat_awal),0) AS berat
+         FROM transaksi_setor
+         WHERE tanggal BETWEEN $1 AND $2`,
         [start, end]
       ),
 
       one(
         `SELECT COALESCE(SUM(jumlah),0) AS total
-         FROM transaksi_penarikan WHERE tanggal BETWEEN $1 AND $2`,
+         FROM transaksi_penarikan
+         WHERE tanggal BETWEEN $1 AND $2`,
         [start, end]
       ),
 
       one(
-        `SELECT COALESCE(SUM(total),0) AS total,
-         COALESCE(SUM(berat_jual),0) AS berat
-         FROM transaksi_penjualan WHERE tanggal BETWEEN $1 AND $2`,
+        `SELECT
+           COALESCE(SUM(total),0) AS total,
+           COALESCE(SUM(berat_jual),0) AS berat
+         FROM transaksi_penjualan
+         WHERE tanggal BETWEEN $1 AND $2`,
         [start, end]
       ),
 
       q(
-        `SELECT jenis_sampah AS jenis,
-         SUM(berat_awal) AS berat,
-         SUM(nilai_setor) AS total
+        `SELECT
+           jenis_sampah AS jenis,
+           SUM(berat_awal) AS berat,
+           SUM(nilai_setor) AS total
          FROM transaksi_setor
          WHERE tanggal BETWEEN $1 AND $2
          GROUP BY jenis_sampah`,
@@ -850,7 +1131,14 @@ app.get(
     if (ketua) {
       await q(
         `INSERT INTO laporan_bulanan
-         (id_ketua,bulan,tahun,total_setor,total_penarikan,total_penjualan)
+         (
+           id_ketua,
+           bulan,
+           tahun,
+           total_setor,
+           total_penarikan,
+           total_penjualan
+         )
          VALUES($1,$2,$3,$4,$5,$6)
          ON CONFLICT(id_ketua,bulan,tahun)
          DO UPDATE SET
@@ -868,7 +1156,14 @@ app.get(
       );
     }
 
-    res.json({ month, year, setor, tarik, jual, detail });
+    res.json({
+      month,
+      year,
+      setor,
+      tarik,
+      jual,
+      detail
+    });
   }
 );
 
@@ -904,29 +1199,51 @@ app.get(
     }
 
     const items = await q(
-      `SELECT tanggal,jenis_sampah,
-       berat_awal AS berat,nilai_setor AS nilai,
-       'Setoran' AS tipe
-       FROM transaksi_setor WHERE id_nasabah=$1
+      `SELECT
+         tanggal,
+         jenis_sampah,
+         berat_awal AS berat,
+         nilai_setor AS nilai,
+         'Setoran' AS tipe
+       FROM transaksi_setor
+       WHERE id_nasabah=$1
 
        UNION ALL
 
-       SELECT tanggal,'-' AS jenis_sampah,
-       0 AS berat,jumlah AS nilai,
-       'Penarikan' AS tipe
-       FROM transaksi_penarikan WHERE id_nasabah=$1
+       SELECT
+         tanggal,
+         '-' AS jenis_sampah,
+         0 AS berat,
+         jumlah AS nilai,
+         'Penarikan' AS tipe
+       FROM transaksi_penarikan
+       WHERE id_nasabah=$1
 
        ORDER BY tanggal DESC`,
       [customer.id_nasabah]
     );
 
-    res.json({ customer, items });
+    res.json({
+      customer,
+      items
+    });
   }
 );
 
+// 404 API
+app.use("/api", (_req, res) => {
+  res.status(404).json({
+    error: "Endpoint API tidak ditemukan."
+  });
+});
+
 // ERROR HANDLER
 app.use((err, _req, res, _next) => {
-  console.error(err);
+  console.error("Server error:", err);
+
+  if (res.headersSent) {
+    return;
+  }
 
   res.status(500).json({
     error: "Terjadi kesalahan pada server. Periksa log backend."
@@ -934,7 +1251,8 @@ app.use((err, _req, res, _next) => {
 });
 
 // VERCEL + LOCAL SERVER
-const isDirectRun = process.argv[1] &&
+const isDirectRun =
+  process.argv[1] &&
   path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 let dbInitPromise;
@@ -981,7 +1299,8 @@ export default async function handler(req, res) {
 
     return res.status(500).json({
       ok: false,
-      error: "Database belum dapat diinisialisasi. Periksa DATABASE_URL dan log backend."
+      error:
+        "Database belum dapat diinisialisasi. Periksa DATABASE_URL dan log backend."
     });
   }
 }

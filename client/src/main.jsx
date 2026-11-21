@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   LayoutDashboard, Recycle, Wallet, Users, Scale, ShoppingCart,
@@ -60,8 +60,11 @@ function App() {
     password: 'lestari',
   });
 
+  const loadRequestRef = useRef(0);
+  const toastTimerRef = useRef(null);
+
   async function api(path, opts = {}) {
-    const r = await fetch(API + path, {
+    const response = await fetch(API + path, {
       ...opts,
       headers: {
         'Content-Type': 'application/json',
@@ -70,89 +73,145 @@ function App() {
       },
     });
 
-    const j = await r.json();
+    let result;
 
-    if (!r.ok) {
-      throw new Error(j.error || 'Terjadi kesalahan');
+    try {
+      result = await response.json();
+    } catch {
+      throw new Error('Server memberikan respons yang tidak valid.');
     }
 
-    return j;
+    if (!response.ok) {
+      if (response.status === 401 && path !== '/login') {
+        logout();
+      }
+
+      throw new Error(
+        result?.error || 'Terjadi kesalahan saat menghubungi server.'
+      );
+    }
+
+    return result;
   }
 
-  function message(t) {
-    setToast(t);
-    setTimeout(() => setToast(''), 3000);
+  function message(text) {
+    setToast(text);
+
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
+    }
+
+    toastTimerRef.current = setTimeout(() => {
+      setToast('');
+      toastTimerRef.current = null;
+    }, 3000);
   }
 
   async function load() {
+    const requestId = ++loadRequestRef.current;
+
     if (!token) return;
 
     try {
+      let result = {};
+
       if (page === 'dashboard') {
-        setData(await api('/dashboard'));
+        result = await api('/dashboard');
       } else if (page === 'nasabah') {
-        setData({ rows: await api('/nasabah') });
+        result = { rows: await api('/nasabah') };
       } else if (page === 'harga') {
-        setData({ rows: await api('/harga') });
+        result = { rows: await api('/harga') };
       } else if (page === 'setoran') {
-        setData({
-          customers: await api('/nasabah'),
-          prices: await api('/harga'),
-        });
+        const [customers, prices] = await Promise.all([
+          api('/nasabah'),
+          api('/harga'),
+        ]);
+
+        result = { customers, prices };
       } else if (page === 'penarikan') {
-        setData({ customers: await api('/nasabah') });
+        result = { customers: await api('/nasabah') };
       } else if (page === 'penjualan') {
-        setData({
-          rows: await api('/penjualan'),
-          prices: await api('/harga'),
-          collectors: await api('/pengepul'),
-        });
+        const [rows, prices, collectors] = await Promise.all([
+          api('/penjualan'),
+          api('/harga'),
+          api('/pengepul'),
+        ]);
+
+        result = { rows, prices, collectors };
       } else if (page === 'laporan') {
-        setData(await api('/laporan'));
+        result = await api('/laporan');
       } else if (page === 'notifikasi') {
-        setData({ rows: await api('/notifications') });
+        result = { rows: await api('/notifications') };
       } else if (page === 'saldo') {
-        setData(await api('/riwayat-saya'));
+        result = await api('/riwayat-saya');
       }
-    } catch (e) {
-      message(e.message);
+
+      if (requestId === loadRequestRef.current) {
+        setData(result);
+      }
+    } catch (error) {
+      if (requestId === loadRequestRef.current) {
+        message(error.message);
+      }
     }
   }
 
   useEffect(() => {
     load();
+
+    return () => {
+      loadRequestRef.current++;
+    };
   }, [token, page]);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) {
+        clearTimeout(toastTimerRef.current);
+      }
+    };
+  }, []);
 
   async function doLogin(e) {
     e.preventDefault();
+
+    if (busy) return;
+
     setBusy(true);
 
     try {
-      const d = await api('/login', {
+      const result = await api('/login', {
         method: 'POST',
         body: JSON.stringify(login),
       });
 
-      setToken(d.token);
-      setUser(d.user);
+      setToken(result.token);
+      setUser(result.user);
 
-      localStorage.setItem('bsl_token', d.token);
-      localStorage.setItem('bsl_user', JSON.stringify(d.user));
+      localStorage.setItem('bsl_token', result.token);
+      localStorage.setItem(
+        'bsl_user',
+        JSON.stringify(result.user)
+      );
 
-      message('Selamat datang, ' + d.user.nama_user);
-    } catch (e) {
-      message(e.message);
+      message('Selamat datang, ' + result.user.nama_user);
+    } catch (error) {
+      message(error.message);
     } finally {
       setBusy(false);
     }
   }
 
   function logout() {
+    loadRequestRef.current++;
+
     setToken('');
     setUser(null);
+    setData({});
+    setPage('dashboard');
+
     localStorage.removeItem('bsl_token');
     localStorage.removeItem('bsl_user');
-    setPage('dashboard');
   }
 
   const nav = [
@@ -167,7 +226,9 @@ function App() {
     ['notifikasi', 'Notifikasi', Bell, ['Ketua', 'Bendahara', 'Petugas Timbang', 'Nasabah']],
   ];
 
-  const visible = nav.filter((n) => n[3].includes(user?.role));
+  const visible = nav.filter((item) =>
+    item[3].includes(user?.role)
+  );
 
   if (!token || !user) {
     return (
@@ -210,7 +271,9 @@ function App() {
 
         <div className="side-bottom">
           <div className="user-mini">
-            <div className="avatar">{user.nama_user?.[0]}</div>
+            <div className="avatar">
+              {user.nama_user?.[0] || '?'}
+            </div>
             <div>
               <b>{user.nama_user}</b>
               <small>{user.role}</small>
@@ -228,20 +291,25 @@ function App() {
         <header className="topbar">
           <div>
             <span className="eyebrow">SISTEM INFORMASI</span>
-            <h1>{nav.find((n) => n[0] === page)?.[1] || 'Dasbor'}</h1>
+            <h1>
+              {nav.find((item) => item[0] === page)?.[1] || 'Dasbor'}
+            </h1>
           </div>
 
           <div className="top-actions">
             <button
               className="icon-btn"
               onClick={() => setPage('notifikasi')}
+              aria-label="Buka notifikasi"
             >
               <Bell size={19} />
               <i />
             </button>
 
             <div className="profile">
-              <div className="avatar">{user.nama_user?.[0]}</div>
+              <div className="avatar">
+                {user.nama_user?.[0] || '?'}
+              </div>
               <span>
                 <b>{user.nama_user}</b>
                 <small>{user.role}</small>
@@ -253,31 +321,64 @@ function App() {
 
         <div className="content">
           {page === 'dashboard' && (
-            <Dashboard data={data} setPage={setPage} />
+            <Dashboard
+              data={data}
+              user={user}
+              setPage={setPage}
+            />
           )}
 
           {page === 'nasabah' && (
-            <Nasabah data={data} api={api} message={message} reload={load} />
+            <Nasabah
+              data={data}
+              api={api}
+              message={message}
+              reload={load}
+            />
           )}
 
           {page === 'harga' && (
-            <Harga data={data} api={api} message={message} reload={load} />
+            <Harga
+              data={data}
+              api={api}
+              message={message}
+              reload={load}
+            />
           )}
 
           {page === 'setoran' && (
-            <Setoran data={data} api={api} message={message} reload={load} />
+            <Setoran
+              data={data}
+              api={api}
+              message={message}
+              reload={load}
+            />
           )}
 
           {page === 'penarikan' && (
-            <Penarikan data={data} api={api} message={message} reload={load} />
+            <Penarikan
+              data={data}
+              api={api}
+              message={message}
+              reload={load}
+            />
           )}
 
           {page === 'penjualan' && (
-            <Penjualan data={data} api={api} message={message} reload={load} />
+            <Penjualan
+              data={data}
+              api={api}
+              message={message}
+              reload={load}
+            />
           )}
 
           {page === 'laporan' && (
-            <Laporan data={data} api={api} setData={setData} />
+            <Laporan
+              data={data}
+              api={api}
+              setData={setData}
+            />
           )}
 
           {page === 'notifikasi' && (
@@ -311,10 +412,12 @@ function Login({ login, setLogin, submit, busy, toast }) {
         <div className="art-logo">
           <Recycle size={78} />
         </div>
+
         <h1>
           Bank Sampah<br />
           <b>Lestari</b>
         </h1>
+
         <p>Menjaga Lingkungan, Menambah Manfaat</p>
         <div className="art-leaves">♻　🌱　♻</div>
         <small>Mulai langkah kecil untuk bumi yang lebih baik.</small>
@@ -340,6 +443,7 @@ function Login({ login, setLogin, submit, busy, toast }) {
               setLogin({ ...login, username: e.target.value })
             }
             placeholder="Masukkan nama pengguna"
+            autoComplete="username"
             required
           />
         </label>
@@ -353,6 +457,7 @@ function Login({ login, setLogin, submit, busy, toast }) {
               setLogin({ ...login, password: e.target.value })
             }
             placeholder="Masukkan kata sandi"
+            autoComplete="current-password"
             required
           />
         </label>
@@ -393,10 +498,14 @@ function Heading({ title, desc, action }) {
 }
 
 function Card({ children, className = '' }) {
-  return <section className={'card ' + className}>{children}</section>;
+  return (
+    <section className={'card ' + className}>
+      {children}
+    </section>
+  );
 }
 
-function Dashboard({ data, setPage }) {
+function Dashboard({ data, user, setPage }) {
   const cards = [
     ['Total Nasabah', data.nasabah || 0, 'orang', Users, 'green'],
     ['Total Setoran', fmt(data.setor), 'akumulasi', Recycle, 'blue'],
@@ -410,11 +519,13 @@ function Dashboard({ data, setPage }) {
         <div>
           <span className="eyebrow light">RINGKASAN OPERASIONAL</span>
           <h2>
-            Selamat datang,{' '}
-            {JSON.parse(localStorage.getItem('bsl_user') || '{}').nama_user}!
+            Selamat datang, {user?.nama_user || 'Pengguna'}!
           </h2>
-          <p>Lihat ringkasan kegiatan Bank Sampah Lestari hari ini.</p>
+          <p>
+            Lihat ringkasan kegiatan Bank Sampah Lestari hari ini.
+          </p>
         </div>
+
         <div className="welcome-mark">
           <Leaf size={66} />
         </div>
@@ -438,8 +549,11 @@ function Dashboard({ data, setPage }) {
           <div className="card-title">
             <div>
               <h3>Setoran Sampah</h3>
-              <p>Jumlah berat sampah yang terkumpul berdasarkan jenisnya</p>
+              <p>
+                Jumlah berat sampah yang terkumpul berdasarkan jenisnya
+              </p>
             </div>
+
             <button
               className="text-button"
               onClick={() => setPage('setoran')}
@@ -449,30 +563,34 @@ function Dashboard({ data, setPage }) {
           </div>
 
           <div className="chart">
-            {(data.chart || []).map((x) => (
-              <div className="bar-row" key={x.jenis}>
-                <span>{x.jenis}</span>
-                <div className="bar-track">
-                  <i
-                    style={{
-                      width:
-                        Math.min(
-                          100,
-                          (Number(x.berat) /
-                            Math.max(
-                              1,
-                              ...(data.chart || []).map((v) =>
-                                Number(v.berat)
-                              )
-                            )) *
-                            100
-                        ) + '%',
-                    }}
-                  />
+            {(data.chart || []).map((item) => {
+              const maxWeight = Math.max(
+                1,
+                ...(data.chart || []).map((row) =>
+                  Number(row.berat) || 0
+                )
+              );
+
+              return (
+                <div className="bar-row" key={item.jenis}>
+                  <span>{item.jenis}</span>
+                  <div className="bar-track">
+                    <i
+                      style={{
+                        width:
+                          Math.min(
+                            100,
+                            (Number(item.berat || 0) / maxWeight) * 100
+                          ) + '%',
+                      }}
+                    />
+                  </div>
+                  <b>
+                    {Number(item.berat || 0).toLocaleString('id-ID')} kg
+                  </b>
                 </div>
-                <b>{Number(x.berat).toLocaleString('id-ID')} kg</b>
-              </div>
-            ))}
+              );
+            })}
 
             {!data.chart?.length && (
               <p className="empty">Belum ada data setoran.</p>
@@ -524,14 +642,15 @@ function Dashboard({ data, setPage }) {
                 <th>Nilai Setoran</th>
               </tr>
             </thead>
+
             <tbody>
-              {(data.recent || []).map((x) => (
-                <tr key={x.id}>
-                  <td><b>{x.nama}</b></td>
-                  <td>{fmtDate(x.tanggal)}</td>
-                  <td>{x.jenis_sampah}</td>
-                  <td>{x.berat} kg</td>
-                  <td className="positive">{fmt(x.nilai)}</td>
+              {(data.recent || []).map((item) => (
+                <tr key={item.id}>
+                  <td><b>{item.nama}</b></td>
+                  <td>{fmtDate(item.tanggal)}</td>
+                  <td>{item.jenis_sampah}</td>
+                  <td>{item.berat} kg</td>
+                  <td className="positive">{fmt(item.nilai)}</td>
                 </tr>
               ))}
             </tbody>
@@ -557,8 +676,10 @@ function Nasabah({ data, api, message, reload }) {
   const [show, setShow] = useState(false);
   const [q, setQ] = useState('');
 
-  const rows = (data.rows || []).filter((x) =>
-    (x.nama + x.no_buku).toLowerCase().includes(q.toLowerCase())
+  const rows = (data.rows || []).filter((item) =>
+    `${item.nama || ''} ${item.no_buku || ''}`
+      .toLowerCase()
+      .includes(q.toLowerCase())
   );
 
   async function save(e) {
@@ -570,12 +691,17 @@ function Nasabah({ data, api, message, reload }) {
         body: JSON.stringify(form),
       });
 
-      message('Nasabah berhasil ditambahkan');
-      setForm({ no_buku: '', nama: '', alamat: '', no_hp: '' });
+      message('Nasabah berhasil ditambahkan.');
+      setForm({
+        no_buku: '',
+        nama: '',
+        alamat: '',
+        no_hp: '',
+      });
       setShow(false);
-      reload();
-    } catch (e) {
-      message(e.message);
+      await reload();
+    } catch (error) {
+      message(error.message);
     }
   }
 
@@ -585,7 +711,10 @@ function Nasabah({ data, api, message, reload }) {
         title="Data Nasabah"
         desc="Kelola data anggota Bank Sampah Lestari."
         action={
-          <button className="primary" onClick={() => setShow(!show)}>
+          <button
+            className="primary"
+            onClick={() => setShow(!show)}
+          >
             <Plus size={17} /> Tambah Nasabah
           </button>
         }
@@ -599,18 +728,22 @@ function Nasabah({ data, api, message, reload }) {
               ['nama', 'Nama Nasabah'],
               ['alamat', 'Alamat'],
               ['no_hp', 'Nomor HP'],
-            ].map(([k, l]) => (
-              <label key={k}>
-                {l}
+            ].map(([key, label]) => (
+              <label key={key}>
+                {label}
                 <input
-                  required={k === 'no_buku' || k === 'nama'}
-                  value={form[k]}
+                  required={key === 'no_buku' || key === 'nama'}
+                  value={form[key]}
                   onChange={(e) =>
-                    setForm({ ...form, [k]: e.target.value })
+                    setForm({
+                      ...form,
+                      [key]: e.target.value,
+                    })
                   }
                 />
               </label>
             ))}
+
             <button className="primary">Simpan Nasabah</button>
           </form>
         </Card>
@@ -621,6 +754,7 @@ function Nasabah({ data, api, message, reload }) {
           <h3>
             Daftar Nasabah <span className="count">{rows.length}</span>
           </h3>
+
           <div className="search">
             <Search size={16} />
             <input
@@ -633,12 +767,12 @@ function Nasabah({ data, api, message, reload }) {
 
         <Table
           headers={['No. Buku', 'Nama', 'Alamat', 'No. HP', 'Saldo']}
-          rows={rows.map((x) => [
-            x.no_buku,
-            x.nama,
-            x.alamat,
-            x.no_hp,
-            <b>{fmt(x.saldo)}</b>,
+          rows={rows.map((item) => [
+            item.no_buku,
+            item.nama,
+            item.alamat,
+            item.no_hp,
+            <b>{fmt(item.saldo)}</b>,
           ])}
         />
       </Card>
@@ -652,20 +786,27 @@ function Table({ headers, rows }) {
       <table>
         <thead>
           <tr>
-            {headers.map((h) => <th key={h}>{h}</th>)}
+            {headers.map((header) => (
+              <th key={header}>{header}</th>
+            ))}
           </tr>
         </thead>
+
         <tbody>
-          {rows.map((r, i) => (
-            <tr key={i}>
-              {r.map((v, j) => <td key={j}>{v}</td>)}
+          {rows.map((row, index) => (
+            <tr key={index}>
+              {row.map((value, cellIndex) => (
+                <td key={cellIndex}>{value}</td>
+              ))}
             </tr>
           ))}
         </tbody>
       </table>
 
       {!rows.length && (
-        <p className="empty">Belum ada data yang dapat ditampilkan.</p>
+        <p className="empty">
+          Belum ada data yang dapat ditampilkan.
+        </p>
       )}
     </div>
   );
@@ -675,18 +816,29 @@ function Harga({ data, api, message, reload }) {
   const [values, setValues] = useState({});
 
   async function save(id, current) {
+    const value = values[id] ?? current;
+
+    if (
+      value === '' ||
+      !Number.isFinite(Number(value)) ||
+      Number(value) < 0
+    ) {
+      message('Masukkan harga yang valid.');
+      return;
+    }
+
     try {
       await api('/harga/' + id, {
         method: 'PUT',
         body: JSON.stringify({
-          harga_per_kg: values[id] ?? current,
+          harga_per_kg: Number(value),
         }),
       });
 
       message('Harga sampah berhasil diperbarui.');
-      reload();
-    } catch (e) {
-      message(e.message);
+      await reload();
+    } catch (error) {
+      message(error.message);
     }
   }
 
@@ -694,7 +846,7 @@ function Harga({ data, api, message, reload }) {
     <>
       <Heading
         title="Kelola Harga Sampah"
-        desc="Tentukan harga pembelian setiap jenis sampah per kilogram. Harga tersebut akan digunakan secara otomatis saat setoran dicatat."
+        desc="Tentukan harga pembelian setiap jenis sampah per kilogram. Harga ini digunakan secara otomatis saat setoran dicatat."
       />
 
       <Card>
@@ -710,26 +862,28 @@ function Harga({ data, api, message, reload }) {
             'Terakhir Diperbarui',
             'Tindakan',
           ]}
-          rows={(data.rows || []).map((x) => [
-            <b>{x.jenis_sampah}</b>,
+          rows={(data.rows || []).map((item) => [
+            <b>{item.jenis_sampah}</b>,
             <div className="price-input">
               Rp
               <input
                 type="number"
                 min="0"
-                value={values[x.id_harga] ?? x.harga_per_kg}
+                value={values[item.id_harga] ?? item.harga_per_kg}
                 onChange={(e) =>
                   setValues({
                     ...values,
-                    [x.id_harga]: e.target.value,
+                    [item.id_harga]: e.target.value,
                   })
                 }
               />
             </div>,
-            fmtDate(x.tgl_mulai),
+            fmtDate(item.tgl_mulai),
             <button
               className="small-primary"
-              onClick={() => save(x.id_harga, x.harga_per_kg)}
+              onClick={() =>
+                save(item.id_harga, item.harga_per_kg)
+              }
             >
               Simpan
             </button>,
@@ -744,17 +898,33 @@ function Setoran({ data, api, message, reload }) {
   const [customer, setCustomer] = useState('');
   const [items, setItems] = useState({});
   const [tanggal, setTanggal] = useState(dateNow());
+  const [saving, setSaving] = useState(false);
 
   const prices = data.prices || [];
 
   const total = prices.reduce(
-    (s, p) =>
-      s + Number(items[p.jenis_sampah] || 0) * p.harga_per_kg,
+    (sum, price) =>
+      sum +
+      Number(items[price.jenis_sampah] || 0) *
+      Number(price.harga_per_kg || 0),
     0
   );
 
   async function save(e) {
     e.preventDefault();
+
+    if (saving) return;
+
+    const hasWeight = prices.some(
+      (price) => Number(items[price.jenis_sampah] || 0) > 0
+    );
+
+    if (!hasWeight) {
+      message('Masukkan berat minimal satu jenis sampah.');
+      return;
+    }
+
+    setSaving(true);
 
     try {
       const result = await api('/setoran', {
@@ -762,18 +932,20 @@ function Setoran({ data, api, message, reload }) {
         body: JSON.stringify({
           id_nasabah: customer,
           tanggal,
-          items: prices.map((p) => ({
-            jenis: p.jenis_sampah,
-            berat: Number(items[p.jenis_sampah] || 0),
+          items: prices.map((price) => ({
+            jenis: price.jenis_sampah,
+            berat: Number(items[price.jenis_sampah] || 0),
           })),
         }),
       });
 
       message('Setoran tersimpan. Nilai: ' + fmt(result.total));
       setItems({});
-      reload();
-    } catch (e) {
-      message(e.message);
+      await reload();
+    } catch (error) {
+      message(error.message);
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -797,9 +969,12 @@ function Setoran({ data, api, message, reload }) {
                 required
               >
                 <option value="">Pilih nasabah</option>
-                {(data.customers || []).map((n) => (
-                  <option value={n.id_nasabah} key={n.id_nasabah}>
-                    {n.nama} — {n.no_buku}
+                {(data.customers || []).map((item) => (
+                  <option
+                    value={item.id_nasabah}
+                    key={item.id_nasabah}
+                  >
+                    {item.nama} — {item.no_buku}
                   </option>
                 ))}
               </select>
@@ -811,29 +986,35 @@ function Setoran({ data, api, message, reload }) {
                 type="date"
                 value={tanggal}
                 onChange={(e) => setTanggal(e.target.value)}
+                required
               />
             </div>
 
-            <div className="section-label">Jenis dan Berat Sampah</div>
+            <div className="section-label">
+              Jenis dan Berat Sampah
+            </div>
 
             <div className="weight-grid">
-              {prices.map((p) => (
-                <label key={p.id_harga}>
+              {prices.map((price) => (
+                <label key={price.id_harga}>
                   <span>
-                    {p.jenis_sampah}
-                    <small>{fmt(p.harga_per_kg)}/kg</small>
+                    {price.jenis_sampah}
+                    <small>
+                      {fmt(price.harga_per_kg)}/kg
+                    </small>
                   </span>
+
                   <div>
                     <input
                       type="number"
                       min="0"
                       step=".1"
                       placeholder="0"
-                      value={items[p.jenis_sampah] || ''}
+                      value={items[price.jenis_sampah] || ''}
                       onChange={(e) =>
                         setItems({
                           ...items,
-                          [p.jenis_sampah]: e.target.value,
+                          [price.jenis_sampah]: e.target.value,
                         })
                       }
                     />
@@ -843,8 +1024,12 @@ function Setoran({ data, api, message, reload }) {
               ))}
             </div>
 
-            <button className="primary full">
-              <Recycle size={17} /> Simpan Setoran
+            <button
+              className="primary full"
+              disabled={saving}
+            >
+              <Recycle size={17} />
+              {saving ? 'Menyimpan...' : 'Simpan Setoran'}
             </button>
           </Card>
 
@@ -852,9 +1037,11 @@ function Setoran({ data, api, message, reload }) {
             <div className="stat-icon green">
               <Wallet />
             </div>
+
             <h3>Ringkasan Setoran</h3>
             <p>Total estimasi nilai setoran</p>
             <strong>{fmt(total)}</strong>
+
             <div className="summary-note">
               Nilai akhir dihitung otomatis dari berat sampah dikalikan harga aktif.
             </div>
@@ -872,8 +1059,14 @@ function Penarikan({ data, api, message, reload }) {
     keterangan: '',
   });
 
+  const [saving, setSaving] = useState(false);
+
   async function save(e) {
     e.preventDefault();
+
+    if (saving) return;
+
+    setSaving(true);
 
     try {
       await api('/penarikan', {
@@ -881,20 +1074,25 @@ function Penarikan({ data, api, message, reload }) {
         body: JSON.stringify(form),
       });
 
-      message('Penarikan berhasil dicatat');
+      message('Penarikan berhasil dicatat.');
+
       setForm({
         id_nasabah: '',
         jumlah: '',
         keterangan: '',
       });
-      reload();
-    } catch (e) {
-      message(e.message);
+
+      await reload();
+    } catch (error) {
+      message(error.message);
+    } finally {
+      setSaving(false);
     }
   }
 
   const selected = (data.customers || []).find(
-    (x) => String(x.id_nasabah) === String(form.id_nasabah)
+    (item) =>
+      String(item.id_nasabah) === String(form.id_nasabah)
   );
 
   return (
@@ -912,13 +1110,20 @@ function Penarikan({ data, api, message, reload }) {
               required
               value={form.id_nasabah}
               onChange={(e) =>
-                setForm({ ...form, id_nasabah: e.target.value })
+                setForm({
+                  ...form,
+                  id_nasabah: e.target.value,
+                })
               }
             >
               <option value="">Pilih nasabah</option>
-              {(data.customers || []).map((n) => (
-                <option value={n.id_nasabah} key={n.id_nasabah}>
-                  {n.nama}
+
+              {(data.customers || []).map((item) => (
+                <option
+                  value={item.id_nasabah}
+                  key={item.id_nasabah}
+                >
+                  {item.nama}
                 </option>
               ))}
             </select>
@@ -935,9 +1140,13 @@ function Penarikan({ data, api, message, reload }) {
             <input
               type="number"
               min="1"
+              step="1"
               value={form.jumlah}
               onChange={(e) =>
-                setForm({ ...form, jumlah: e.target.value })
+                setForm({
+                  ...form,
+                  jumlah: e.target.value,
+                })
               }
               required
               placeholder="Masukkan jumlah penarikan"
@@ -949,13 +1158,18 @@ function Penarikan({ data, api, message, reload }) {
             <textarea
               value={form.keterangan}
               onChange={(e) =>
-                setForm({ ...form, keterangan: e.target.value })
+                setForm({
+                  ...form,
+                  keterangan: e.target.value,
+                })
               }
               placeholder="Keterangan penarikan (opsional)"
             />
           </label>
 
-          <button className="primary full">Simpan Penarikan</button>
+          <button className="primary full" disabled={saving}>
+            {saving ? 'Menyimpan...' : 'Simpan Penarikan'}
+          </button>
         </form>
       </Card>
     </>
@@ -971,8 +1185,14 @@ function Penjualan({ data, api, message, reload }) {
     pembeli: '',
   });
 
+  const [saving, setSaving] = useState(false);
+
   async function save(e) {
     e.preventDefault();
+
+    if (saving) return;
+
+    setSaving(true);
 
     try {
       await api('/penjualan', {
@@ -980,11 +1200,19 @@ function Penjualan({ data, api, message, reload }) {
         body: JSON.stringify(form),
       });
 
-      message('Penjualan berhasil dicatat');
-      setForm({ ...form, berat_jual: '', harga_jual: '' });
-      reload();
-    } catch (e) {
-      message(e.message);
+      message('Penjualan berhasil dicatat.');
+
+      setForm({
+        ...form,
+        berat_jual: '',
+        harga_jual: '',
+      });
+
+      await reload();
+    } catch (error) {
+      message(error.message);
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -1005,13 +1233,22 @@ function Penjualan({ data, api, message, reload }) {
               <select
                 value={form.id_pengepul}
                 onChange={(e) =>
-                  setForm({ ...form, id_pengepul: e.target.value })
+                  setForm({
+                    ...form,
+                    id_pengepul: e.target.value,
+                  })
                 }
               >
-                <option value="">Pilih pengepul (tidak wajib)</option>
-                {(data.collectors || []).map((x) => (
-                  <option value={x.id_pengepul} key={x.id_pengepul}>
-                    {x.nama}
+                <option value="">
+                  Pilih pengepul (tidak wajib)
+                </option>
+
+                {(data.collectors || []).map((item) => (
+                  <option
+                    value={item.id_pengepul}
+                    key={item.id_pengepul}
+                  >
+                    {item.nama}
                   </option>
                 ))}
               </select>
@@ -1022,11 +1259,20 @@ function Penjualan({ data, api, message, reload }) {
               <select
                 value={form.jenis_sampah}
                 onChange={(e) =>
-                  setForm({ ...form, jenis_sampah: e.target.value })
+                  setForm({
+                    ...form,
+                    jenis_sampah: e.target.value,
+                  })
                 }
+                required
               >
-                {(data.prices || []).map((x) => (
-                  <option key={x.id_harga}>{x.jenis_sampah}</option>
+                {(data.prices || []).map((item) => (
+                  <option
+                    key={item.id_harga}
+                    value={item.jenis_sampah}
+                  >
+                    {item.jenis_sampah}
+                  </option>
                 ))}
               </select>
             </label>
@@ -1040,7 +1286,10 @@ function Penjualan({ data, api, message, reload }) {
                 required
                 value={form.berat_jual}
                 onChange={(e) =>
-                  setForm({ ...form, berat_jual: e.target.value })
+                  setForm({
+                    ...form,
+                    berat_jual: e.target.value,
+                  })
                 }
               />
             </label>
@@ -1050,10 +1299,14 @@ function Penjualan({ data, api, message, reload }) {
               <input
                 type="number"
                 min="1"
+                step="1"
                 required
                 value={form.harga_jual}
                 onChange={(e) =>
-                  setForm({ ...form, harga_jual: e.target.value })
+                  setForm({
+                    ...form,
+                    harga_jual: e.target.value,
+                  })
                 }
               />
             </label>
@@ -1063,12 +1316,17 @@ function Penjualan({ data, api, message, reload }) {
               <input
                 value={form.pembeli}
                 onChange={(e) =>
-                  setForm({ ...form, pembeli: e.target.value })
+                  setForm({
+                    ...form,
+                    pembeli: e.target.value,
+                  })
                 }
               />
             </label>
 
-            <button className="primary full">Simpan Penjualan</button>
+            <button className="primary full" disabled={saving}>
+              {saving ? 'Menyimpan...' : 'Simpan Penjualan'}
+            </button>
           </form>
         </Card>
 
@@ -1076,19 +1334,23 @@ function Penjualan({ data, api, message, reload }) {
           <div className="stat-icon orange">
             <ShoppingCart />
           </div>
+
           <h3>Perkiraan Total Penjualan</h3>
+
           <strong>
             {fmt(
               Number(form.berat_jual || 0) *
               Number(form.harga_jual || 0)
             )}
           </strong>
+
           <p>Berat dikalikan harga jual per kilogram.</p>
         </Card>
       </div>
 
       <Card>
         <h3>Riwayat Penjualan</h3>
+
         <Table
           headers={[
             'Tanggal',
@@ -1098,13 +1360,13 @@ function Penjualan({ data, api, message, reload }) {
             'Total',
             'Pengepul',
           ]}
-          rows={(data.rows || []).map((x) => [
-            fmtDate(x.tanggal),
-            x.jenis_sampah,
-            x.berat_jual + ' kg',
-            fmt(x.harga_jual),
-            fmt(x.total),
-            x.nama_pengepul || x.pembeli || '-',
+          rows={(data.rows || []).map((item) => [
+            fmtDate(item.tanggal),
+            item.jenis_sampah,
+            item.berat_jual + ' kg',
+            fmt(item.harga_jual),
+            fmt(item.total),
+            item.nama_pengepul || item.pembeli || '-',
           ])}
         />
       </Card>
@@ -1113,16 +1375,31 @@ function Penjualan({ data, api, message, reload }) {
 }
 
 function Laporan({ data, api, setData }) {
-  const [month, setMonth] = useState(new Date().getMonth() + 1);
-  const [year, setYear] = useState(new Date().getFullYear());
+  const [month, setMonth] = useState(
+    new Date().getMonth() + 1
+  );
+
+  const [year, setYear] = useState(
+    new Date().getFullYear()
+  );
+
+  const [loading, setLoading] = useState(false);
 
   async function show() {
+    if (loading) return;
+
+    setLoading(true);
+
     try {
-      setData(
-        await api(`/laporan?month=${month}&year=${year}`)
+      const result = await api(
+        `/laporan?month=${month}&year=${year}`
       );
-    } catch (e) {
-      alert(e.message);
+
+      setData(result);
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -1132,7 +1409,10 @@ function Laporan({ data, api, setData }) {
         title="Laporan Bulanan"
         desc="Rangkuman setoran, penarikan, dan penjualan pada periode yang dipilih."
         action={
-          <button className="primary" onClick={() => window.print()}>
+          <button
+            className="primary"
+            onClick={() => window.print()}
+          >
             <Printer size={17} /> Cetak Laporan
           </button>
         }
@@ -1144,14 +1424,16 @@ function Laporan({ data, api, setData }) {
             Bulan
             <select
               value={month}
-              onChange={(e) => setMonth(e.target.value)}
+              onChange={(e) => setMonth(Number(e.target.value))}
             >
               {[
                 'Januari', 'Februari', 'Maret', 'April',
                 'Mei', 'Juni', 'Juli', 'Agustus',
                 'September', 'Oktober', 'November', 'Desember',
-              ].map((x, i) => (
-                <option value={i + 1} key={x}>{x}</option>
+              ].map((name, index) => (
+                <option value={index + 1} key={name}>
+                  {name}
+                </option>
               ))}
             </select>
           </label>
@@ -1160,13 +1442,19 @@ function Laporan({ data, api, setData }) {
             Tahun
             <input
               type="number"
+              min="2000"
+              max="2100"
               value={year}
-              onChange={(e) => setYear(e.target.value)}
+              onChange={(e) => setYear(Number(e.target.value))}
             />
           </label>
 
-          <button className="primary" onClick={show}>
-            Tampilkan Laporan
+          <button
+            className="primary"
+            onClick={show}
+            disabled={loading}
+          >
+            {loading ? 'Memuat...' : 'Tampilkan Laporan'}
           </button>
         </div>
 
@@ -1192,11 +1480,15 @@ function Laporan({ data, api, setData }) {
         <h3>Rincian Setoran Berdasarkan Jenis Sampah</h3>
 
         <Table
-          headers={['Jenis Sampah', 'Berat Terkumpul', 'Total Nilai']}
-          rows={(data.detail || []).map((x) => [
-            x.jenis,
-            x.berat + ' kg',
-            fmt(x.total),
+          headers={[
+            'Jenis Sampah',
+            'Berat Terkumpul',
+            'Total Nilai',
+          ]}
+          rows={(data.detail || []).map((item) => [
+            item.jenis,
+            item.berat + ' kg',
+            fmt(item.total),
           ])}
         />
       </Card>
@@ -1213,16 +1505,18 @@ function Notifications({ data }) {
       />
 
       <div className="notification-list">
-        {(data.rows || []).map((x) => (
-          <Card className="notification" key={x.id}>
+        {(data.rows || []).map((item) => (
+          <Card className="notification" key={item.id}>
             <div className="notice-icon">
               <Bell size={19} />
             </div>
+
             <div>
-              <b>{x.message}</b>
-              <small>{fmtDate(x.created_at)}</small>
+              <b>{item.message}</b>
+              <small>{fmtDate(item.created_at)}</small>
             </div>
-            <span className="status">Berhasil</span>
+
+            <span className="status">Informasi</span>
           </Card>
         ))}
       </div>
@@ -1248,8 +1542,10 @@ function Saldo({ data }) {
         <div className="stat-icon green">
           <Wallet />
         </div>
+
         <span>Saldo tersedia</span>
         <strong>{fmt(data.customer?.saldo)}</strong>
+
         <small>
           {data.customer?.nama || 'Data nasabah belum tersedia.'}
         </small>
@@ -1257,15 +1553,16 @@ function Saldo({ data }) {
 
       <Card>
         <h3>Riwayat Transaksi</h3>
+
         <Table
           headers={['Tanggal', 'Jenis', 'Kategori', 'Nilai']}
-          rows={(data.items || []).map((x) => [
-            fmtDate(x.tanggal),
-            x.tipe,
-            x.jenis_sampah,
-            x.tipe === 'Setoran'
-              ? <b className="positive">+ {fmt(x.nilai)}</b>
-              : <b className="negative">- {fmt(x.nilai)}</b>,
+          rows={(data.items || []).map((item) => [
+            fmtDate(item.tanggal),
+            item.tipe,
+            item.jenis_sampah,
+            item.tipe === 'Setoran'
+              ? <b className="positive">+ {fmt(item.nilai)}</b>
+              : <b className="negative">- {fmt(item.nilai)}</b>,
           ])}
         />
       </Card>
@@ -1273,4 +1570,10 @@ function Saldo({ data }) {
   );
 }
 
-createRoot(document.getElementById('root')).render(<App />);
+const rootElement = document.getElementById('root');
+
+if (!rootElement) {
+  throw new Error('Elemen root tidak ditemukan pada index.html.');
+}
+
+createRoot(rootElement).render(<App />);

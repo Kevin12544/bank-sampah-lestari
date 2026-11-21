@@ -24,16 +24,21 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
   throw new Error("JWT_SECRET wajib diisi minimal 32 karakter.");
 }
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl:
-    process.env.DATABASE_SSL === "false"
-      ? false
-      : { rejectUnauthorized: false },
-  max: 5,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000
-});
+const pool =
+  globalThis.__bankSampahPool ||
+  new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl:
+      process.env.DATABASE_SSL === "false"
+        ? false
+        : { rejectUnauthorized: false },
+    max: 1,
+    idleTimeoutMillis: 10000,
+    connectionTimeoutMillis: 15000,
+    allowExitOnIdle: true
+  });
+
+globalThis.__bankSampahPool = pool;
 
 pool.on("error", error => {
   console.error("Database pool error:", error);
@@ -99,6 +104,15 @@ app.use(
 );
 
 app.use(express.json({ limit: "1mb" }));
+
+app.use(async (_req, _res, next) => {
+  try {
+    await ensureDb();
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 // HELPERS
 const q = async (sql, params = []) =>
@@ -1336,20 +1350,6 @@ if (isDirectRun) {
     });
 }
 
-export default async function handler(req, res) {
-  try {
-    await ensureDb();
-    return app(req, res);
-  } catch (error) {
-    console.error(
-      "Gagal menginisialisasi database:",
-      error
-    );
-
-    return res.status(500).json({
-      ok: false,
-      error:
-        "Database belum dapat diinisialisasi. Periksa DATABASE_URL dan log backend."
-    });
-  }
+export default function handler(req, res) {
+  return app(req, res);
 }

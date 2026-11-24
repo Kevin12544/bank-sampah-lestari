@@ -61,7 +61,9 @@ export default function App() {
   const [user, setUser] = useState(readStoredUser);
   const [page, setPage] = useState(() => defaultPageForRole(readStoredUser()?.role));
   const [data, setData] = useState({});
-  const [loadingPage, setLoadingPage] = useState(false);
+  const [loadingPage, setLoadingPage] = useState(() =>
+    Boolean(localStorage.getItem('bsl_token'))
+  );
 
   const [loginBusy, setLoginBusy] = useState(false);
   const [loginError, setLoginError] = useState('');
@@ -263,6 +265,7 @@ export default function App() {
       });
 
       const landingPage = defaultPageForRole(result.user.role);
+      setLoadingPage(true);
       setData({});
       setPage(landingPage);
       setToken(result.token);
@@ -280,9 +283,11 @@ export default function App() {
   }
 
   function handleNavigate(nextPage) {
+    setMobileMenuOpen(false);
+    if (nextPage === page) return;
+    setLoadingPage(true);
     setData({});
     setPage(nextPage);
-    setMobileMenuOpen(false);
   }
 
   function handlePasswordChanged(res) {

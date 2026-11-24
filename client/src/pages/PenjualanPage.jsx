@@ -273,8 +273,8 @@ export default function PenjualanPage({ data, api, notify, reload }) {
                 Berat yang Dijual (kg) *
                 <input
                   type="number"
-                  min="0.01"
-                  step="0.01"
+                  min="0.001"
+                  step="any"
                   max={stokTersedia > 0 ? stokTersedia : undefined}
                   required
                   value={form.berat_jual}
@@ -290,7 +290,7 @@ export default function PenjualanPage({ data, api, notify, reload }) {
                 <input
                   type="number"
                   min="1"
-                  step="100"
+                  step="any"
                   required
                   value={form.harga_jual}
                   onChange={(e) =>

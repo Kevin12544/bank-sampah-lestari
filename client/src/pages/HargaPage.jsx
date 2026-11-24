@@ -139,7 +139,7 @@ export default function HargaPage({ data, api, notify, reload }) {
                 <input
                   type="number"
                   min="0"
-                  step="100"
+                  step="1"
                   value={rawVal ?? item.harga_per_kg}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') {
@@ -206,7 +206,7 @@ export default function HargaPage({ data, api, notify, reload }) {
               type="number"
               required
               min="0"
-              step="100"
+              step="1"
               placeholder="Contoh: 3500"
               value={newForm.harga_per_kg}
               onChange={(e) =>

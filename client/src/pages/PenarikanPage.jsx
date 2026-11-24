@@ -163,7 +163,7 @@ export default function PenarikanPage({ data, api, notify, reload }) {
               <input
                 type="number"
                 min="1"
-                step="100"
+                step="any"
                 max={selected ? saldoTersedia : undefined}
                 value={form.jumlah}
                 onChange={(e) => setForm({ ...form, jumlah: e.target.value })}

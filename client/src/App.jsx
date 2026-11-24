@@ -170,11 +170,14 @@ export default function App() {
     return () => document.removeEventListener('mousedown', onDocClick);
   }, [profileMenuOpen]);
 
+  const userRole = user?.role || '';
+  const userId = user?.id || 0;
+
   const load = useCallback(async () => {
     const requestId = ++loadRequestRef.current;
-    if (!token || !user) return;
+    if (!token || !userRole || !userId) return;
 
-    const allowed = NAV_ITEMS.find((n) => n[0] === page)?.[3]?.includes(user.role);
+    const allowed = NAV_ITEMS.find((n) => n[0] === page)?.[3]?.includes(userRole);
     if (!allowed) return;
 
     setLoadingPage(true);
@@ -239,7 +242,7 @@ export default function App() {
         setLoadingPage(false);
       }
     }
-  }, [token, user, page, api, notify]);
+  }, [token, userRole, userId, page, api, notify]);
 
   useEffect(() => {
     load();

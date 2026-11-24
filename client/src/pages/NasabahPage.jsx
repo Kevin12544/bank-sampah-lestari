@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   Plus,
   Search,
@@ -41,6 +41,7 @@ export default function NasabahPage({ data, api, notify, reload }) {
 
   const [historyData, setHistoryData] = useState(null);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const historyReqRef = useRef(0);
 
   const allRows = data.rows || [];
   const rows = allRows.filter((item) =>
@@ -134,17 +135,30 @@ export default function NasabahPage({ data, api, notify, reload }) {
   }
 
   async function openHistory(item) {
+    const reqId = ++historyReqRef.current;
     setLoadingHistory(true);
     setHistoryData({ customer: item, items: [] });
     try {
       const res = await api(`/nasabah/${item.id_nasabah}/riwayat`);
-      setHistoryData(res);
+      if (reqId === historyReqRef.current) {
+        setHistoryData(res);
+      }
     } catch (error) {
-      notify(error.message, 'error');
-      setHistoryData(null);
+      if (reqId === historyReqRef.current) {
+        notify(error.message, 'error');
+        setHistoryData(null);
+      }
     } finally {
-      setLoadingHistory(false);
+      if (reqId === historyReqRef.current) {
+        setLoadingHistory(false);
+      }
     }
+  }
+
+  function closeHistory() {
+    historyReqRef.current++;
+    setLoadingHistory(false);
+    setHistoryData(null);
   }
 
   function handleExport() {
@@ -370,7 +384,7 @@ export default function NasabahPage({ data, api, notify, reload }) {
 
       <Modal
         open={Boolean(historyData)}
-        onClose={() => setHistoryData(null)}
+        onClose={closeHistory}
         title={`Mutasi Rekening — ${historyData?.customer?.nama || ''}`}
         subtitle={
           historyData?.customer

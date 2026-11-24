@@ -143,13 +143,10 @@ export default function App() {
       try {
         const freshUser = await api('/me');
         if (!active) return;
-        setUser(freshUser);
-        localStorage.setItem('bsl_user', JSON.stringify(freshUser));
-
-        const notifRes = await api('/notifications');
-        if (active) {
-          setUnreadCount(Number(notifRes?.unreadCount || 0));
-        }
+        const { unreadCount: unread, ...profile } = freshUser;
+        setUser(profile);
+        localStorage.setItem('bsl_user', JSON.stringify(profile));
+        setUnreadCount(Number(unread || 0));
       } catch {
         // 401 sudah ditangani otomatis oleh onUnauthorized
       }
@@ -193,25 +190,11 @@ export default function App() {
       } else if (page === 'harga') {
         result = { rows: await api('/harga') };
       } else if (page === 'setoran') {
-        const [customers, prices, history] = await Promise.all([
-          api('/nasabah'),
-          api('/harga'),
-          api('/setoran'),
-        ]);
-        result = { customers, prices, history };
+        result = await api('/page/setoran');
       } else if (page === 'penarikan') {
-        const [customers, history] = await Promise.all([
-          api('/nasabah'),
-          api('/penarikan'),
-        ]);
-        result = { customers, history };
+        result = await api('/page/penarikan');
       } else if (page === 'penjualan') {
-        const [rows, prices, collectors] = await Promise.all([
-          api('/penjualan'),
-          api('/harga'),
-          api('/pengepul'),
-        ]);
-        result = { rows, prices, collectors };
+        result = await api('/page/penjualan');
       } else if (page === 'laporan') {
         result = await api('/laporan');
       } else if (page === 'notifikasi') {
@@ -223,11 +206,7 @@ export default function App() {
       } else if (page === 'saldo') {
         result = await api('/riwayat-saya');
       } else if (page === 'users') {
-        const [usersList, nasabahList] = await Promise.all([
-          api('/users'),
-          api('/nasabah'),
-        ]);
-        result = { users: usersList, nasabah: nasabahList };
+        result = await api('/page/users');
       } else if (page === 'audit') {
         result = { rows: await api('/audit-logs') };
       }

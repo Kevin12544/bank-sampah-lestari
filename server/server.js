@@ -65,9 +65,9 @@ const pool =
       process.env.DATABASE_SSL === "false"
         ? false
         : { rejectUnauthorized: false },
-    max: 3,
-    idleTimeoutMillis: 10000,
-    connectionTimeoutMillis: 15000,
+    max: 1,
+    idleTimeoutMillis: 5000,
+    connectionTimeoutMillis: 20000,
     allowExitOnIdle: true
   });
 
@@ -164,7 +164,7 @@ app.get("/api/health", async (_req, res) => {
     res.json({
       ok: true,
       app: "Bank Sampah Lestari",
-      version: "2.1.0",
+      version: "2.1.1",
       database: "connected",
       timezone: "Asia/Makassar",
       date: today()
@@ -189,9 +189,41 @@ app.use(async (_req, _res, next) => {
   }
 });
 
-// DB HELPERS
+// DB HELPERS dengan retry otomatis untuk galat koneksi pooler transien
+function isTransientDbError(error) {
+  const msg = String(error?.message || "");
+  const code = String(error?.code || "");
+  return (
+    code === "53300" ||
+    code === "57P01" ||
+    code === "08006" ||
+    code === "08001" ||
+    code === "ECONNRESET" ||
+    code === "ETIMEDOUT" ||
+    /MaxClientsInSessionMode|max clients reached|Connection terminated|timeout expired/i.test(
+      msg
+    )
+  );
+}
+
+async function queryWithRetry(sql, params = [], attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await pool.query(sql, params);
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientDbError(err) || i === attempts - 1) {
+        throw err;
+      }
+      await new Promise(resolve => setTimeout(resolve, 160 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 const q = async (sql, params = []) =>
-  (await pool.query(sql, params)).rows;
+  (await queryWithRetry(sql, params)).rows;
 
 const one = async (sql, params = []) =>
   (await q(sql, params))[0] || null;
@@ -224,7 +256,8 @@ async function notify(
 }
 
 async function getWasteStock(db = pool) {
-  const { rows } = await db.query(`
+  const exec = db === pool ? queryWithRetry : (sql, params) => db.query(sql, params);
+  const { rows } = await exec(`
     SELECT
       h.id_harga,
       h.jenis_sampah,
@@ -697,6 +730,8 @@ app.post("/api/login", loginLimiter, async (req, res) => {
 
 app.get("/api/me", auth, async (req, res) => {
   let id_nasabah = null;
+  let unreadCount = 0;
+
   if (req.user.role === "Nasabah") {
     const cust = await one(
       "SELECT id_nasabah, no_buku, saldo FROM nasabah WHERE id_user = $1",
@@ -704,12 +739,23 @@ app.get("/api/me", auth, async (req, res) => {
     );
     if (cust) {
       id_nasabah = Number(cust.id_nasabah);
+      const cnt = await one(
+        "SELECT COUNT(*)::int AS n FROM notifications WHERE id_nasabah = $1 AND is_read = FALSE",
+        [id_nasabah]
+      );
+      unreadCount = cnt?.n || 0;
     }
+  } else {
+    const cnt = await one(
+      "SELECT COUNT(*)::int AS n FROM notifications WHERE audience IN ('staff', 'all') AND is_read = FALSE"
+    );
+    unreadCount = cnt?.n || 0;
   }
 
   res.json({
     ...req.user,
-    id_nasabah
+    id_nasabah,
+    unreadCount
   });
 });
 
@@ -3039,6 +3085,121 @@ app.get(
     });
   }
 );
+
+// ===========================
+// ENDPOINT TERPADU PER HALAMAN (1 KONEKSI SERVERLESS)
+// ===========================
+
+app.get(
+  "/api/page/setoran",
+  auth,
+  allow("Ketua", "Bendahara", "Petugas Timbang"),
+  async (_req, res) => {
+    const customers = await q(
+      "SELECT id_nasabah, no_buku, nama, saldo FROM nasabah ORDER BY nama ASC"
+    );
+    const prices = await getWasteStock();
+    const history = await q(`
+      SELECT
+        t.id_setor,
+        t.id_nasabah,
+        n.no_buku,
+        n.nama AS nama_nasabah,
+        TO_CHAR(t.tanggal, 'YYYY-MM-DD') AS tanggal,
+        t.jenis_sampah,
+        t.berat_awal,
+        t.harga,
+        t.nilai_setor,
+        t.petugas,
+        t.created_at
+      FROM transaksi_setor t
+      JOIN nasabah n ON n.id_nasabah = t.id_nasabah
+      ORDER BY t.tanggal DESC, t.id_setor DESC
+      LIMIT 120
+    `);
+    res.json({ customers, prices, history });
+  }
+);
+
+app.get(
+  "/api/page/penarikan",
+  auth,
+  allow("Ketua", "Bendahara"),
+  async (_req, res) => {
+    const customers = await q(
+      "SELECT id_nasabah, no_buku, nama, saldo FROM nasabah ORDER BY nama ASC"
+    );
+    const history = await q(`
+      SELECT
+        p.id_penarikan,
+        p.id_nasabah,
+        n.no_buku,
+        n.nama AS nama_nasabah,
+        TO_CHAR(p.tanggal, 'YYYY-MM-DD') AS tanggal,
+        p.jumlah,
+        p.keterangan,
+        p.petugas,
+        p.created_at
+      FROM transaksi_penarikan p
+      JOIN nasabah n ON n.id_nasabah = p.id_nasabah
+      ORDER BY p.tanggal DESC, p.id_penarikan DESC
+      LIMIT 120
+    `);
+    res.json({ customers, history });
+  }
+);
+
+app.get(
+  "/api/page/penjualan",
+  auth,
+  allow("Ketua", "Bendahara"),
+  async (_req, res) => {
+    const rows = await q(`
+      SELECT
+        p.id_penjualan,
+        p.id_pengepul,
+        TO_CHAR(p.tanggal, 'YYYY-MM-DD') AS tanggal,
+        p.jenis_sampah,
+        p.berat_jual,
+        p.harga_jual,
+        p.total,
+        p.pembeli,
+        p.created_at,
+        g.nama AS nama_pengepul
+      FROM transaksi_penjualan p
+      LEFT JOIN pengepul g ON g.id_pengepul = p.id_pengepul
+      ORDER BY p.tanggal DESC, p.id_penjualan DESC
+      LIMIT 120
+    `);
+    const prices = await getWasteStock();
+    const collectors = await q("SELECT * FROM pengepul ORDER BY nama ASC");
+    res.json({ rows, prices, collectors });
+  }
+);
+
+app.get("/api/page/users", auth, allow("Ketua"), async (_req, res) => {
+  const users = await q(`
+    SELECT
+      u.id_user,
+      u.username,
+      u.role,
+      u.nama_user,
+      u.is_active,
+      u.must_change_password,
+      u.created_at,
+      u.last_login_at,
+      n.id_nasabah,
+      n.no_buku,
+      n.nama AS nama_nasabah
+    FROM users u
+    LEFT JOIN nasabah n ON n.id_user = u.id_user
+    ORDER BY u.id_user ASC
+  `);
+  const nasabah = await q(
+    "SELECT id_nasabah, id_user, no_buku, nama FROM nasabah ORDER BY nama ASC"
+  );
+  res.json({ users, nasabah });
+});
 
 // 404 API
 app.use("/api", (_req, res) => {

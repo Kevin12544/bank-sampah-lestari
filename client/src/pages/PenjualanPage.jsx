@@ -40,6 +40,7 @@ export default function PenjualanPage({ data, api, notify, reload }) {
   const [pForm, setPForm] = useState({ nama: '', kontak: '', alamat: '' });
   const [savingPengepul, setSavingPengepul] = useState(false);
   const [deletePengepul, setDeletePengepul] = useState(null);
+  const [deletingPengepul, setDeletingPengepul] = useState(false);
 
   // Void sale
   const [voidTarget, setVoidTarget] = useState(null);
@@ -135,14 +136,17 @@ export default function PenjualanPage({ data, api, notify, reload }) {
   }
 
   async function handleDeletePengepul() {
-    if (!deletePengepul) return;
+    if (!deletePengepul || deletingPengepul) return;
+    setDeletingPengepul(true);
     try {
       await api(`/pengepul/${deletePengepul.id_pengepul}`, { method: 'DELETE' });
+      await reload();
       notify('Pengepul dihapus.', 'success');
       setDeletePengepul(null);
-      await reload();
     } catch (error) {
       notify(error.message, 'error');
+    } finally {
+      setDeletingPengepul(false);
     }
   }
 
@@ -524,6 +528,7 @@ export default function PenjualanPage({ data, api, notify, reload }) {
         message={`Hapus pengepul "${deletePengepul?.nama}" dari daftar?`}
         confirmLabel="Ya, Hapus"
         danger
+        busy={deletingPengepul}
         onConfirm={handleDeletePengepul}
         onCancel={() => setDeletePengepul(null)}
       />

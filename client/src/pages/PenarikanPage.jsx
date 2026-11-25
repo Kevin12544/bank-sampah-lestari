@@ -19,7 +19,8 @@ import {
 import { dateNow, fmt, fmtDate } from '../utils/format.js';
 
 export default function PenarikanPage({ data, user, api, notify, reload }) {
-  const canEditSetting = user?.role === 'Ketua';
+  const canEditSetting =
+    user?.role === 'Ketua' && data.minPenarikan !== undefined;
   const [form, setForm] = useState({
     id_nasabah: '',
     tanggal: dateNow(),

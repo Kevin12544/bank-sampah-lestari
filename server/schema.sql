@@ -123,6 +123,12 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS pengaturan (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_setor_tanggal ON transaksi_setor(tanggal DESC);
 CREATE INDEX IF NOT EXISTS idx_setor_nasabah ON transaksi_setor(id_nasabah);
 CREATE INDEX IF NOT EXISTS idx_penarikan_tanggal ON transaksi_penarikan(tanggal DESC);

@@ -45,6 +45,7 @@ const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_ISSUER = "bank-sampah-lestari";
 const JWT_EXPIRES_IN = "8h";
+const DEFAULT_MIN_PENARIKAN = 50000;
 
 if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL belum diatur.");
@@ -164,7 +165,7 @@ app.get("/api/health", async (_req, res) => {
     res.json({
       ok: true,
       app: "Bank Sampah Lestari",
-      version: "2.1.1",
+      version: "2.1.2",
       database: "connected",
       timezone: "Asia/Makassar",
       date: today()
@@ -227,6 +228,21 @@ const q = async (sql, params = []) =>
 
 const one = async (sql, params = []) =>
   (await q(sql, params))[0] || null;
+
+async function getMinPenarikan(db = pool) {
+  try {
+    const exec = db === pool ? queryWithRetry : (sql, params) => db.query(sql, params);
+    const { rows } = await exec(
+      "SELECT value FROM pengaturan WHERE key = 'min_penarikan' LIMIT 1"
+    );
+    if (!rows.length || !validNumber(rows[0].value)) {
+      return DEFAULT_MIN_PENARIKAN;
+    }
+    return Math.max(0, round2(rows[0].value));
+  } catch {
+    return DEFAULT_MIN_PENARIKAN;
+  }
+}
 
 function signUserToken(user) {
   const payload = {
@@ -427,7 +443,20 @@ async function initDb() {
       locked_until TIMESTAMPTZ,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS pengaturan (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `);
+
+  await pool.query(
+    `INSERT INTO pengaturan(key, value)
+     VALUES('min_penarikan', $1)
+     ON CONFLICT(key) DO NOTHING`,
+    [String(DEFAULT_MIN_PENARIKAN)]
+  );
 
   // Idempotent schema upgrades for existing production tables
   await pool.query(`
@@ -2150,6 +2179,61 @@ app.delete(
 );
 
 // ===========================
+// PENGATURAN KEBIJAKAN OPERASIONAL
+// ===========================
+
+app.get("/api/settings", auth, async (_req, res) => {
+  const minPenarikan = await getMinPenarikan();
+  res.json({ min_penarikan: minPenarikan });
+});
+
+app.put(
+  "/api/settings/penarikan",
+  auth,
+  allow("Ketua"),
+  async (req, res) => {
+    const rawMin = req.body?.min_penarikan;
+    if (!validNumber(rawMin) || Number(rawMin) < 0 || Number(rawMin) > 100_000_000) {
+      return res.status(400).json({
+        error: "Nominal minimum penarikan tidak valid (minimal Rp 0)."
+      });
+    }
+
+    const nextMin = round2(rawMin);
+    const prevMin = await getMinPenarikan();
+
+    await q(
+      `INSERT INTO pengaturan(key, value, updated_at)
+       VALUES('min_penarikan', $1, NOW())
+       ON CONFLICT(key) DO UPDATE SET
+         value = EXCLUDED.value,
+         updated_at = NOW()`,
+      [String(nextMin)]
+    );
+
+    await notify({
+      message: `Batas minimum penarikan saldo diperbarui dari Rp ${formatRupiah(prevMin)} menjadi Rp ${formatRupiah(nextMin)}.`,
+      type: "info",
+      audience: "staff"
+    });
+
+    await recordAudit(pool, {
+      req,
+      action: "SETTINGS_UPDATE",
+      entity: "pengaturan",
+      entityId: "min_penarikan",
+      detail: `Minimum penarikan: Rp ${formatRupiah(prevMin)} -> Rp ${formatRupiah(nextMin)}`
+    });
+
+    res.json({
+      ok: true,
+      message: `Batas minimum penarikan berhasil diperbarui menjadi Rp ${formatRupiah(nextMin)}.`,
+      min_penarikan: nextMin
+    });
+  }
+);
+
+// ===========================
 // PENARIKAN SALDO
 // ===========================
 
@@ -2216,6 +2300,22 @@ app.post(
       if (!customer) {
         await client.query("ROLLBACK");
         return res.status(404).json({ error: "Nasabah tidak ditemukan." });
+      }
+
+      const minPenarikan = await getMinPenarikan(client);
+
+      if (minPenarikan > 0 && num(customer.saldo) < minPenarikan) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: `Saldo nasabah (Rp ${formatRupiah(customer.saldo)}) belum mencapai batas minimum penarikan Rp ${formatRupiah(minPenarikan)}.`
+        });
+      }
+
+      if (minPenarikan > 0 && amount < minPenarikan) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: `Nominal penarikan minimal Rp ${formatRupiah(minPenarikan)}.`
+        });
       }
 
       if (amount > num(customer.saldo)) {
@@ -3011,14 +3111,15 @@ app.get(
   auth,
   allow("Nasabah"),
   async (req, res) => {
-    const [customer, prices] = await Promise.all([
+    const [customer, prices, minPenarikan] = await Promise.all([
       one("SELECT * FROM nasabah WHERE id_user = $1", [req.user.id]),
       q(
         `SELECT id_harga, jenis_sampah, harga_per_kg,
                 TO_CHAR(tgl_mulai, 'YYYY-MM-DD') AS tgl_mulai
          FROM harga_sampah
          ORDER BY id_harga`
-      )
+      ),
+      getMinPenarikan()
     ]);
 
     if (!customer) {
@@ -3026,7 +3127,8 @@ app.get(
         customer: null,
         items: [],
         summary: { totalSetor: 0, totalTarik: 0, totalBeratKg: 0, jumlahTransaksi: 0 },
-        prices
+        prices,
+        minPenarikan
       });
     }
 
@@ -3081,7 +3183,8 @@ app.get(
       customer,
       items,
       summary,
-      prices
+      prices,
+      minPenarikan
     });
   }
 );
@@ -3145,7 +3248,8 @@ app.get(
       ORDER BY p.tanggal DESC, p.id_penarikan DESC
       LIMIT 120
     `);
-    res.json({ customers, history });
+    const minPenarikan = await getMinPenarikan();
+    res.json({ customers, history, minPenarikan });
   }
 );
 

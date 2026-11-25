@@ -1,15 +1,25 @@
 import React, { useState } from 'react';
-import { Wallet, Search, RotateCcw, AlertTriangle } from 'lucide-react';
 import {
+  Wallet,
+  Search,
+  RotateCcw,
+  AlertTriangle,
+  SlidersHorizontal,
+  Info,
+} from 'lucide-react';
+import {
+  Badge,
   Card,
   ConfirmDialog,
   DataTable,
   Heading,
+  Modal,
   ReceiptModal,
 } from '../components/UI.jsx';
 import { dateNow, fmt, fmtDate } from '../utils/format.js';
 
-export default function PenarikanPage({ data, api, notify, reload }) {
+export default function PenarikanPage({ data, user, api, notify, reload }) {
+  const canEditSetting = user?.role === 'Ketua';
   const [form, setForm] = useState({
     id_nasabah: '',
     tanggal: dateNow(),
@@ -25,8 +35,15 @@ export default function PenarikanPage({ data, api, notify, reload }) {
   const [voidTarget, setVoidTarget] = useState(null);
   const [voiding, setVoiding] = useState(false);
 
+  // Modal pengaturan batas minimum penarikan
+  const [settingOpen, setSettingOpen] = useState(false);
+  const [minInput, setMinInput] = useState('');
+  const [savingMin, setSavingMin] = useState(false);
+
   const customers = data.customers || [];
   const history = data.history || [];
+  const minPenarikan =
+    data.minPenarikan !== undefined ? Number(data.minPenarikan) : 50000;
 
   const selected = customers.find(
     (item) => String(item.id_nasabah) === String(form.id_nasabah)
@@ -34,14 +51,71 @@ export default function PenarikanPage({ data, api, notify, reload }) {
 
   const saldoTersedia = Number(selected?.saldo || 0);
   const jumlahNum = Number(form.jumlah || 0);
-  const exceedsSaldo = Boolean(selected && jumlahNum > saldoTersedia);
+
+  const insufficientForMin = Boolean(
+    selected && minPenarikan > 0 && saldoTersedia < minPenarikan
+  );
+  const belowMin = Boolean(
+    selected &&
+      !insufficientForMin &&
+      minPenarikan > 0 &&
+      form.jumlah !== '' &&
+      jumlahNum < minPenarikan
+  );
+  const exceedsSaldo = Boolean(
+    selected && form.jumlah !== '' && jumlahNum > saldoTersedia
+  );
+
+  function openSettingModal() {
+    setMinInput(String(minPenarikan));
+    setSettingOpen(true);
+  }
+
+  async function saveMinSetting(e) {
+    e.preventDefault();
+    if (savingMin) return;
+
+    const val = Number(minInput);
+    if (minInput === '' || !Number.isFinite(val) || val < 0) {
+      notify('Masukkan nominal minimum yang valid (minimal Rp 0).', 'error');
+      return;
+    }
+
+    setSavingMin(true);
+    try {
+      const res = await api('/settings/penarikan', {
+        method: 'PUT',
+        body: JSON.stringify({ min_penarikan: val }),
+      });
+      await reload();
+      notify(res.message || 'Batas minimum penarikan diperbarui.', 'success');
+      setSettingOpen(false);
+    } catch (error) {
+      notify(error.message, 'error');
+    } finally {
+      setSavingMin(false);
+    }
+  }
 
   function handleFormSubmit(e) {
     e.preventDefault();
     if (saving || !selected) return;
 
+    if (insufficientForMin) {
+      notify(
+        `Saldo nasabah (${fmt(saldoTersedia)}) belum mencapai batas minimum penarikan (${fmt(minPenarikan)}).`,
+        'error'
+      );
+      return;
+    }
+
     if (!Number.isFinite(jumlahNum) || jumlahNum <= 0) {
       notify('Masukkan jumlah penarikan lebih dari Rp 0.', 'error');
+      return;
+    }
+
+    if (minPenarikan > 0 && jumlahNum < minPenarikan) {
+      notify(`Nominal penarikan minimal ${fmt(minPenarikan)}.`, 'error');
       return;
     }
 
@@ -93,9 +167,9 @@ export default function PenarikanPage({ data, api, notify, reload }) {
       const res = await api(`/penarikan/${voidTarget.id_penarikan}`, {
         method: 'DELETE',
       });
+      await reload();
       notify(res.message || 'Penarikan dibatalkan.', 'warning');
       setVoidTarget(null);
-      await reload();
     } catch (error) {
       notify(error.message, 'error');
     } finally {
@@ -109,17 +183,62 @@ export default function PenarikanPage({ data, api, notify, reload }) {
       .includes(search.toLowerCase())
   );
 
+  // Bangun daftar tombol preset valid (>= minPenarikan dan <= saldoTersedia)
+  const quickPresets = (() => {
+    if (!selected || saldoTersedia <= 0 || insufficientForMin) return [];
+    const list = [];
+    const seen = new Set();
+
+    const addPreset = (label, amount) => {
+      const rounded = Math.floor(amount);
+      if (rounded <= 0 || rounded > saldoTersedia) return;
+      if (minPenarikan > 0 && rounded < minPenarikan) return;
+      if (seen.has(rounded)) return;
+      seen.add(rounded);
+      list.push({ label, amount: rounded });
+    };
+
+    if (minPenarikan > 0) {
+      addPreset('Minimum', minPenarikan);
+    }
+    addPreset('25%', saldoTersedia * 0.25);
+    addPreset('50%', saldoTersedia * 0.5);
+    addPreset('75%', saldoTersedia * 0.75);
+    addPreset('Tarik Semua', saldoTersedia);
+    return list;
+  })();
+
   return (
     <div className="page-enter">
       <Heading
         title="Penarikan Saldo"
-        desc="Catat pencairan saldo oleh nasabah. Saldo divalidasi secara atomik di server sebelum dicairkan."
+        desc="Catat pencairan saldo oleh nasabah. Saldo dan batas minimum divalidasi secara atomik di server."
+        action={
+          canEditSetting ? (
+            <button
+              type="button"
+              className="secondary-btn"
+              onClick={openSettingModal}
+            >
+              <SlidersHorizontal size={16} />
+              Atur Minimum ({minPenarikan > 0 ? fmt(minPenarikan) : 'Bebas'})
+            </button>
+          ) : null
+        }
       />
 
       <div className="transaction-layout">
         <Card>
           <form className="stack-form" onSubmit={handleFormSubmit}>
-            <h3>Formulir Penarikan</h3>
+            <div className="card-title" style={{ marginBottom: 4 }}>
+              <h3>Formulir Penarikan</h3>
+              <Badge variant={minPenarikan > 0 ? 'orange' : 'muted'}>
+                <Info size={12} />
+                {minPenarikan > 0
+                  ? `Min. penarikan ${fmt(minPenarikan)}`
+                  : 'Tanpa batas minimum'}
+              </Badge>
+            </div>
 
             <div className="form-grid">
               <label>
@@ -158,41 +277,64 @@ export default function PenarikanPage({ data, api, notify, reload }) {
               </div>
             )}
 
+            {insufficientForMin && (
+              <div className="inline-error" role="alert">
+                <AlertTriangle size={15} />
+                <span>
+                  Saldo nasabah ({fmt(saldoTersedia)}) belum mencapai batas minimum penarikan sebesar{' '}
+                  <b>{fmt(minPenarikan)}</b>.
+                </span>
+              </div>
+            )}
+
             <label>
               Jumlah Penarikan (Rp) *
               <input
                 type="number"
-                min="1"
+                min={minPenarikan > 0 ? minPenarikan : 1}
                 step="any"
                 max={selected ? saldoTersedia : undefined}
+                disabled={insufficientForMin}
                 value={form.jumlah}
                 onChange={(e) => setForm({ ...form, jumlah: e.target.value })}
                 required
-                placeholder="Masukkan jumlah penarikan"
+                placeholder={
+                  minPenarikan > 0
+                    ? `Minimal ${fmt(minPenarikan)}`
+                    : 'Masukkan jumlah penarikan'
+                }
               />
             </label>
 
-            {selected && saldoTersedia > 0 && (
+            {quickPresets.length > 0 && (
               <div className="quick-chips">
-                {[0.25, 0.5, 0.75, 1].map((ratio) => {
-                  const preset = Math.floor(saldoTersedia * ratio);
-                  if (preset <= 0) return null;
-                  return (
-                    <button
-                      type="button"
-                      key={ratio}
-                      className="chip-btn"
-                      onClick={() => setForm({ ...form, jumlah: String(preset) })}
-                    >
-                      {ratio === 1 ? 'Tarik Semua' : `${ratio * 100}%`} ({fmt(preset)})
-                    </button>
-                  );
-                })}
+                {quickPresets.map((item) => (
+                  <button
+                    type="button"
+                    key={item.label}
+                    className="chip-btn"
+                    onClick={() =>
+                      setForm({ ...form, jumlah: String(item.amount) })
+                    }
+                  >
+                    {item.label} ({fmt(item.amount)})
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {belowMin && (
+              <div className="inline-error" role="alert">
+                <AlertTriangle size={15} />
+                <span>
+                  Nominal penarikan minimal <b>{fmt(minPenarikan)}</b>. Penarikan sebesar{' '}
+                  {fmt(jumlahNum)} tidak diperbolehkan.
+                </span>
               </div>
             )}
 
             {exceedsSaldo && (
-              <div className="inline-error">
+              <div className="inline-error" role="alert">
                 <AlertTriangle size={15} />
                 <span>
                   Nominal melebihi saldo tersedia ({fmt(saldoTersedia)}).
@@ -214,7 +356,14 @@ export default function PenarikanPage({ data, api, notify, reload }) {
 
             <button
               className="primary full"
-              disabled={saving || exceedsSaldo || !selected}
+              disabled={
+                saving ||
+                !selected ||
+                insufficientForMin ||
+                belowMin ||
+                exceedsSaldo ||
+                jumlahNum <= 0
+              }
             >
               <Wallet size={16} />
               {saving ? 'Menyimpan...' : 'Lanjutkan Penarikan'}
@@ -230,6 +379,11 @@ export default function PenarikanPage({ data, api, notify, reload }) {
           <p>Nominal yang akan diserahkan ke nasabah</p>
           <strong>{fmt(jumlahNum)}</strong>
 
+          <div className="summary-projected" style={{ marginBottom: 8 }}>
+            <span>Minimum penarikan aktif</span>
+            <b>{minPenarikan > 0 ? fmt(minPenarikan) : 'Tanpa batas'}</b>
+          </div>
+
           {selected && (
             <div className="summary-projected">
               <span>Estimasi sisa saldo</span>
@@ -240,7 +394,10 @@ export default function PenarikanPage({ data, api, notify, reload }) {
           )}
 
           <div className="summary-note">
-            Pastikan uang tunai telah dihitung sesuai nominal sebelum mengonfirmasi penarikan. Struk dapat langsung dicetak setelah transaksi tersimpan.
+            Penarikan di bawah batas minimum otomatis ditolak oleh sistem (baik di aplikasi maupun server).
+            {canEditSetting && (
+              <> Ketua dapat menyesuaikan batas minimum kapan saja melalui tombol <b>Atur Minimum</b>.</>
+            )}
           </div>
         </Card>
       </div>
@@ -284,6 +441,61 @@ export default function PenarikanPage({ data, api, notify, reload }) {
           ])}
         />
       </Card>
+
+      <Modal
+        open={settingOpen}
+        onClose={savingMin ? undefined : () => setSettingOpen(false)}
+        title="Pengaturan Minimum Penarikan"
+        subtitle="Atur batas nominal minimal setiap kali nasabah mencairkan saldo. Perubahan langsung berlaku di server."
+        width={460}
+      >
+        <form className="stack-form" onSubmit={saveMinSetting}>
+          <label>
+            Minimum Penarikan Saldo (Rp) *
+            <input
+              type="number"
+              min="0"
+              step="1"
+              required
+              value={minInput}
+              onChange={(e) => setMinInput(e.target.value)}
+              placeholder="Contoh: 50000"
+            />
+          </label>
+
+          <div className="quick-chips">
+            {[
+              ['Tanpa batas', 0],
+              ['Rp 20.000', 20000],
+              ['Rp 50.000', 50000],
+              ['Rp 100.000', 100000],
+            ].map(([label, val]) => (
+              <button
+                type="button"
+                key={val}
+                className="chip-btn"
+                onClick={() => setMinInput(String(val))}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          <div className="modal-actions">
+            <button
+              type="button"
+              className="secondary-btn"
+              onClick={() => setSettingOpen(false)}
+              disabled={savingMin}
+            >
+              Batal
+            </button>
+            <button className="primary" disabled={savingMin}>
+              {savingMin ? 'Menyimpan...' : 'Simpan Pengaturan'}
+            </button>
+          </div>
+        </form>
+      </Modal>
 
       <ConfirmDialog
         open={confirmOpen}

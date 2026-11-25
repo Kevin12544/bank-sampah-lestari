@@ -9,6 +9,8 @@ export default function SaldoPage({ data }) {
   const customer = data.customer;
   const summary = data.summary || {};
   const prices = data.prices || [];
+  const minPenarikan =
+    data.minPenarikan !== undefined ? Number(data.minPenarikan) : 50000;
   const items = (data.items || []).filter((tx) =>
     filterType === 'all' ? true : tx.tipe === filterType
   );
@@ -36,6 +38,11 @@ export default function SaldoPage({ data }) {
               ? `${customer.nama} · No. Buku ${customer.no_buku}`
               : 'Rekening nasabah belum ditautkan ke akun ini.'}
           </small>
+          {minPenarikan > 0 && (
+            <small style={{ marginTop: 8, opacity: 0.9 }}>
+              Batas minimum penarikan saldo: <b>{fmt(minPenarikan)}</b>
+            </small>
+          )}
         </Card>
 
         <div className="nasabah-mini-stats">

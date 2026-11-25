@@ -499,7 +499,13 @@ export default function App() {
                 />
               )}
               {page === 'penarikan' && (
-                <PenarikanPage data={data} api={api} notify={notify} reload={load} />
+                <PenarikanPage
+                  data={data}
+                  user={user}
+                  api={api}
+                  notify={notify}
+                  reload={load}
+                />
               )}
               {page === 'penjualan' && (
                 <PenjualanPage data={data} api={api} notify={notify} reload={load} />

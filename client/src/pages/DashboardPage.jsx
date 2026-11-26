@@ -18,6 +18,9 @@ export default function DashboardPage({ data, user, setPage }) {
   const role = user?.role;
   const isManager = role === 'Ketua' || role === 'Bendahara';
 
+  const kasOperasional = Number(data.kasOperasional ?? data.saldoKas ?? 0);
+  const persenPotongan = Number(data.potonganKasPersen ?? 10);
+
   const cards = [
     {
       label: 'Total Nasabah',
@@ -28,18 +31,18 @@ export default function DashboardPage({ data, user, setPage }) {
       color: 'green',
     },
     {
-      label: 'Saldo Kas Operasional',
-      raw: Number(data.saldoKas || 0),
+      label: `Kas Operasional (${persenPotongan}%)`,
+      raw: kasOperasional,
       formatter: (v) => fmt(v),
-      sub: 'penjualan − penarikan',
+      sub: `potongan ${persenPotongan}% dari setoran`,
       Icon: Wallet,
-      color: Number(data.saldoKas || 0) < 0 ? 'red' : 'purple',
+      color: 'purple',
     },
     {
       label: 'Kewajiban Saldo Nasabah',
       raw: Number(data.totalSaldoNasabah || 0),
       formatter: (v) => fmt(v),
-      sub: 'total simpanan anggota',
+      sub: 'akumulasi hak 90% nasabah',
       Icon: TrendingUp,
       color: 'blue',
     },
@@ -47,7 +50,7 @@ export default function DashboardPage({ data, user, setPage }) {
       label: 'Stok Sampah Gudang',
       raw: Number(data.totalStokKg || 0),
       formatter: (v) => fmtKg(v),
-      sub: 'siap dijual ke pengepul',
+      sub: `susut tercatat: ${fmtKg(data.totalSusutKg || 0)}`,
       Icon: Package,
       color: 'orange',
     },
@@ -58,7 +61,7 @@ export default function DashboardPage({ data, user, setPage }) {
     { id: 'penarikan', label: 'Penarikan Saldo', Icon: Wallet, roles: ['Ketua', 'Bendahara'] },
     { id: 'penjualan', label: 'Penjualan Pengepul', Icon: ShoppingCart, roles: ['Ketua', 'Bendahara'] },
     { id: 'nasabah', label: 'Data Nasabah', Icon: Users, roles: ['Ketua', 'Bendahara'] },
-    { id: 'harga', label: 'Kelola Harga', Icon: Scale, roles: ['Ketua', 'Bendahara'] },
+    { id: 'harga', label: 'Harga Periode', Icon: Scale, roles: ['Ketua', 'Bendahara'] },
     { id: 'laporan', label: 'Laporan Bulanan', Icon: FileText, roles: ['Ketua', 'Bendahara'] },
     { id: 'notifikasi', label: 'Notifikasi', Icon: Bell, roles: ['Petugas Timbang'] },
   ].filter((item) => item.roles.includes(role));
@@ -85,7 +88,7 @@ export default function DashboardPage({ data, user, setPage }) {
           <span className="eyebrow light">RINGKASAN OPERASIONAL</span>
           <h2>Selamat datang, {user?.nama_user || 'Pengguna'}!</h2>
           <p>
-            Pantau arus kas, kewajiban saldo nasabah, dan stok sampah secara real-time.
+            Pantau kas operasional (potongan {persenPotongan}%), saldo nasabah (90%), stok gudang, susut, dan siklus penjualan 2 mingguan.
           </p>
         </div>
 
@@ -115,26 +118,36 @@ export default function DashboardPage({ data, user, setPage }) {
 
       <div className="mini-metrics">
         <div>
-          <span>Total Nilai Setoran</span>
-          <b>{fmt(data.setor)}</b>
-          <small>{fmtKg(data.beratSetor)} terkumpul</small>
+          <span>Nilai Setoran (100% Kotor)</span>
+          <b>{fmt(data.setorKotor ?? data.setor)}</b>
+          <small>
+            {fmtKg(data.beratSetor)} · Hak 90%: {fmt(data.setor)}
+          </small>
         </div>
         <div>
           <span>Total Penjualan Pengepul</span>
           <b>{fmt(data.penjualan)}</b>
-          <small>{fmtKg(data.beratJual)} terjual</small>
+          <small>
+            {fmtKg(data.beratJual)} terjual · Susut {fmtKg(data.totalSusutKg || 0)}
+          </small>
         </div>
         <div>
           <span>Total Penarikan Nasabah</span>
           <b>{fmt(data.penarikan)}</b>
-          <small>pencairan tunai</small>
+          <small>Arus jual − tarik: {fmt(data.arusKasPenjualan ?? 0)}</small>
         </div>
         <div>
-          <span>Selisih Jual − Beli</span>
-          <b className={Number(data.marginKotor || 0) >= 0 ? 'positive' : 'negative'}>
-            {fmt(data.marginKotor)}
+          <span>Siklus Jual 2 Mingguan</span>
+          <b className={data.schedule?.isDue !== false ? 'positive' : ''}>
+            {data.schedule?.isDue !== false
+              ? 'Siap Dijual'
+              : `${data.schedule.daysRemaining} hari lagi`}
           </b>
-          <small>estimasi margin kotor</small>
+          <small>
+            {data.schedule?.nextScheduleDate
+              ? `Jadwal: ${fmtDate(data.schedule.nextScheduleDate)}`
+              : 'Siklus 14 hari pengepul'}
+          </small>
         </div>
       </div>
 
@@ -162,7 +175,10 @@ export default function DashboardPage({ data, user, setPage }) {
                 <div className="bar-row" key={item.jenis}>
                   <span className="bar-label">
                     {item.jenis}
-                    <small>Stok: {fmtKg(item.stok)}</small>
+                    <small>
+                      Stok: {fmtKg(item.stok)}
+                      {Number(item.susut || 0) > 0 ? ` · Susut: ${fmtKg(item.susut)}` : ''}
+                    </small>
                   </span>
                   <div className="bar-track">
                     <i

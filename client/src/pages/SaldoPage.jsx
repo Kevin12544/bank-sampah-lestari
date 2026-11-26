@@ -11,6 +11,7 @@ export default function SaldoPage({ data }) {
   const prices = data.prices || [];
   const minPenarikan =
     data.minPenarikan !== undefined ? Number(data.minPenarikan) : 50000;
+  const potonganPersen = Number(data.potonganKasPersen ?? 10);
   const items = (data.items || []).filter((tx) =>
     filterType === 'all' ? true : tx.tipe === filterType
   );
@@ -19,7 +20,7 @@ export default function SaldoPage({ data }) {
     <div className="page-enter">
       <Heading
         title="Saldo Saya"
-        desc="Pantau saldo tabungan sampah, riwayat transaksi pribadi, dan daftar harga sampah terbaru."
+        desc="Pantau saldo tabungan sampah (hak 90% setoran), riwayat transaksi pribadi, dan tarif harga periode berlaku."
       />
 
       <div className="saldo-hero-grid">
@@ -38,17 +39,20 @@ export default function SaldoPage({ data }) {
               ? `${customer.nama} · No. Buku ${customer.no_buku}`
               : 'Rekening nasabah belum ditautkan ke akun ini.'}
           </small>
-          {minPenarikan > 0 && (
-            <small style={{ marginTop: 8, opacity: 0.9 }}>
-              Batas minimum penarikan saldo: <b>{fmt(minPenarikan)}</b>
-            </small>
-          )}
+
+          <small style={{ marginTop: 8, opacity: 0.92, lineHeight: 1.5 }}>
+            Penarikan min. <b>{fmt(minPenarikan)}</b> · Maks. <b>1×/bulan</b> · Bulan <b>Desember</b> boleh tarik seluruh saldo.
+            {data.sudahTarikBulanIni && ' (Status: sudah menarik bulan ini)'}
+          </small>
+          <small style={{ marginTop: 4, opacity: 0.88 }}>
+            Bagi hasil setoran: <b>{100 - potonganPersen}%</b> saldo nasabah · <b>{potonganPersen}%</b> kas operasional.
+          </small>
         </Card>
 
         <div className="nasabah-mini-stats">
           <Card className="stat-card">
             <div className="stat-icon green"><Recycle size={20} /></div>
-            <span>Total Nilai Setoran</span>
+            <span>Total Hak Setoran (90%)</span>
             <strong>{fmt(summary.totalSetor)}</strong>
             <small>{fmtKg(summary.totalBeratKg)} sampah disetor</small>
           </Card>
@@ -93,9 +97,18 @@ export default function SaldoPage({ data }) {
               <Badge variant={item.tipe === 'Setoran' ? 'green' : 'orange'}>
                 {item.tipe}
               </Badge>,
-              item.tipe === 'Setoran'
-                ? item.jenis_sampah
-                : item.keterangan || 'Penarikan saldo',
+              item.tipe === 'Setoran' ? (
+                <div>
+                  <b>{item.jenis_sampah}</b>
+                  {Number(item.potongan_kas || 0) > 0 && (
+                    <small className="cell-sub">
+                      Kotor {fmt(item.nilai_kotor)} · Kas 10%: {fmt(item.potongan_kas)}
+                    </small>
+                  )}
+                </div>
+              ) : (
+                item.keterangan || 'Penarikan saldo'
+              ),
               Number(item.berat || 0) > 0 ? fmtKg(item.berat) : '-',
               item.tipe === 'Setoran' ? (
                 <b className="positive">+ {fmt(item.nilai)}</b>
@@ -111,15 +124,15 @@ export default function SaldoPage({ data }) {
             <div>
               <h3>
                 <Scale size={15} style={{ verticalAlign: 'middle', marginRight: 6 }} />
-                Daftar Harga Sampah Aktif
+                Daftar Harga Periode {data.periodeLabel || 'Aktif'}
               </h3>
-              <p>Acuan harga beli Bank Sampah Lestari per kilogram</p>
+              <p>Harga ditetapkan tiap awal bulan (setoran lama tetap pakai harga saat setor)</p>
             </div>
           </div>
 
           <DataTable
             pageSize={0}
-            headers={['Jenis Sampah', 'Harga/kg', 'Diperbarui']}
+            headers={['Jenis Sampah', 'Harga/kg', 'Berlaku']}
             emptyText="Daftar harga belum tersedia."
             rows={prices.map((p) => [
               <b>{p.jenis_sampah}</b>,

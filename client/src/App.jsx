@@ -188,7 +188,11 @@ export default function App() {
       } else if (page === 'nasabah') {
         result = { rows: await api('/nasabah') };
       } else if (page === 'harga') {
-        result = { rows: await api('/harga') };
+        try {
+          result = await api('/harga-periode');
+        } catch {
+          result = { rows: await api('/harga'), legacyMode: true };
+        }
       } else if (page === 'setoran') {
         result = await api('/page/setoran');
       } else if (page === 'penarikan') {
@@ -487,7 +491,13 @@ export default function App() {
                 <NasabahPage data={data} api={api} notify={notify} reload={load} />
               )}
               {page === 'harga' && (
-                <HargaPage data={data} api={api} notify={notify} reload={load} />
+                <HargaPage
+                  data={data}
+                  setData={setData}
+                  api={api}
+                  notify={notify}
+                  reload={load}
+                />
               )}
               {page === 'setoran' && (
                 <SetoranPage

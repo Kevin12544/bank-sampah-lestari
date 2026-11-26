@@ -5,6 +5,8 @@ import {
   Search,
   RotateCcw,
   CheckCircle2,
+  Percent,
+  Calendar,
 } from 'lucide-react';
 import {
   Badge,
@@ -31,24 +33,31 @@ export default function SetoranPage({ data, user, api, notify, reload }) {
   const prices = data.prices || [];
   const customers = data.customers || [];
   const history = data.history || [];
+  const persenPotongan = Number(data.potonganKasPersen ?? 10);
 
   const selectedCustomer = customers.find(
     (c) => String(c.id_nasabah) === String(customer)
   );
 
   const activeItems = prices
-    .map((price) => ({
-      jenis: price.jenis_sampah,
-      harga: Number(price.harga_per_kg || 0),
-      berat: Number(items[price.jenis_sampah] || 0),
-    }))
+    .map((price) => {
+      const berat = Number(items[price.jenis_sampah] || 0);
+      const harga = Number(price.harga_per_kg || 0);
+      const kotor = Math.round(berat * harga * 100) / 100;
+      const potongan = Math.round(kotor * (persenPotongan / 100) * 100) / 100;
+      const nasabah = Math.round((kotor - potongan) * 100) / 100;
+      return { jenis: price.jenis_sampah, harga, berat, kotor, potongan, nasabah };
+    })
     .filter((i) => i.berat > 0);
 
   const totalBerat = activeItems.reduce((sum, i) => sum + i.berat, 0);
-  const total = activeItems.reduce(
-    (sum, i) => sum + Math.round(i.berat * i.harga * 100) / 100,
-    0
-  );
+  const totalKotor = Math.round(
+    activeItems.reduce((sum, i) => sum + i.kotor, 0) * 100
+  ) / 100;
+  const totalPotonganKas = Math.round(
+    activeItems.reduce((sum, i) => sum + i.potongan, 0) * 100
+  ) / 100;
+  const totalNasabah = Math.round((totalKotor - totalPotonganKas) * 100) / 100;
 
   async function save(e) {
     e.preventDefault();
@@ -75,7 +84,11 @@ export default function SetoranPage({ data, user, api, notify, reload }) {
         }),
       });
 
-      notify('Setoran tersimpan. Nilai: ' + fmt(result.total), 'success');
+      const netVal = result.total_nasabah ?? result.total;
+      notify(
+        `Setoran tersimpan. Hak Nasabah (90%): ${fmt(netVal)} · Kas (10%): ${fmt(result.potongan_kas ?? totalPotonganKas)}`,
+        'success'
+      );
       setItems({});
       if (result.receipt) {
         setReceipt(result.receipt);
@@ -95,9 +108,9 @@ export default function SetoranPage({ data, user, api, notify, reload }) {
       const res = await api(`/setoran/${voidTarget.id_setor}`, {
         method: 'DELETE',
       });
+      await reload();
       notify(res.message || 'Setoran dibatalkan.', 'warning');
       setVoidTarget(null);
-      await reload();
     } catch (error) {
       notify(error.message, 'error');
     } finally {
@@ -115,15 +128,27 @@ export default function SetoranPage({ data, user, api, notify, reload }) {
     <div className="page-enter">
       <Heading
         title="Pencatatan Setoran Sampah"
-        desc="Catat berat sampah nasabah. Saldo bertambah otomatis berdasarkan harga aktif."
+        desc="Catat berat sampah nasabah. Harga diambil otomatis dari HargaPeriode bulan berjalan dan dibagi 10% Kas Operasional : 90% Saldo Nasabah."
       />
 
       <form onSubmit={save}>
         <div className="transaction-layout">
           <Card>
-            <h3>Detail Setoran</h3>
+            <div className="card-title" style={{ marginBottom: 8 }}>
+              <h3>Detail Setoran</h3>
+              <div className="action-row" style={{ flexWrap: 'wrap' }}>
+                {data.periodeLabel && (
+                  <Badge variant="blue">
+                    <Calendar size={12} /> Harga {data.periodeLabel}
+                  </Badge>
+                )}
+                <Badge variant="orange">
+                  <Percent size={12} /> {persenPotongan}% Kas · {100 - persenPotongan}% Nasabah
+                </Badge>
+              </div>
+            </div>
 
-            <div className="form-grid" style={{ marginTop: 14 }}>
+            <div className="form-grid" style={{ marginTop: 12 }}>
               <label>
                 Nama Nasabah *
                 <select
@@ -153,9 +178,7 @@ export default function SetoranPage({ data, user, api, notify, reload }) {
 
             {selectedCustomer && (
               <div className="balance-hint" style={{ marginTop: 12 }}>
-                <span>
-                  Saldo saat ini ({selectedCustomer.no_buku})
-                </span>
+                <span>Saldo saat ini ({selectedCustomer.no_buku})</span>
                 <b>{fmt(selectedCustomer.saldo)}</b>
               </div>
             )}
@@ -208,9 +231,24 @@ export default function SetoranPage({ data, user, api, notify, reload }) {
               <Wallet size={22} />
             </div>
 
-            <h3>Ringkasan Setoran</h3>
-            <p>Total estimasi nilai setoran ({fmtKg(totalBerat)})</p>
-            <strong>{fmt(total)}</strong>
+            <h3>Ringkasan Bagi Hasil Setoran</h3>
+            <p>Masuk ke Saldo Nasabah (90%) · {fmtKg(totalBerat)}</p>
+            <strong>{fmt(totalNasabah)}</strong>
+
+            <div className="summary-breakdown">
+              <div>
+                <span>Nilai Kotor (100%)</span>
+                <b>{fmt(totalKotor)}</b>
+              </div>
+              <div>
+                <span>Potongan Kas Operasional ({persenPotongan}%)</span>
+                <b className="negative">- {fmt(totalPotonganKas)}</b>
+              </div>
+              <div>
+                <span>Hak Saldo Nasabah ({100 - persenPotongan}%)</span>
+                <b className="positive">+ {fmt(totalNasabah)}</b>
+              </div>
+            </div>
 
             {activeItems.length > 0 && (
               <div className="summary-breakdown">
@@ -219,21 +257,21 @@ export default function SetoranPage({ data, user, api, notify, reload }) {
                     <span>
                       <CheckCircle2 size={13} /> {i.jenis} ({fmtKg(i.berat)})
                     </span>
-                    <b>{fmt(i.berat * i.harga)}</b>
+                    <b>{fmt(i.kotor)}</b>
                   </div>
                 ))}
               </div>
             )}
 
-            {selectedCustomer && total > 0 && (
+            {selectedCustomer && totalNasabah > 0 && (
               <div className="summary-projected">
-                <span>Estimasi saldo akhir</span>
-                <b>{fmt(Number(selectedCustomer.saldo || 0) + total)}</b>
+                <span>Estimasi saldo akhir nasabah</span>
+                <b>{fmt(Number(selectedCustomer.saldo || 0) + totalNasabah)}</b>
               </div>
             )}
 
             <div className="summary-note">
-              Nilai akhir dihitung di server secara atomik berdasarkan harga aktif dan dicatat ke log audit.
+              Harga periode disalin permanen pada transaksi setoran ini. 10% otomatis dicatat ke Kas Operasional dan 90% masuk ke saldo nasabah.
             </div>
           </Card>
         </div>
@@ -261,12 +299,17 @@ export default function SetoranPage({ data, user, api, notify, reload }) {
             'Nasabah',
             'Jenis Sampah',
             'Berat',
-            'Nilai Setoran',
+            'Nilai Kotor',
+            'Kas (10%)',
+            'Saldo Nasabah (90%)',
             'Petugas',
             ...(canVoid ? ['Aksi'] : []),
           ]}
           emptyText="Belum ada riwayat setoran."
           rows={filteredHistory.map((row) => {
+            const kotor = row.nilai_kotor ?? row.nilai_setor;
+            const potongan = row.potongan_kas ?? 0;
+            const nasabahVal = row.nilai_nasabah ?? row.nilai_setor;
             const cols = [
               fmtDate(row.tanggal),
               <div>
@@ -275,7 +318,9 @@ export default function SetoranPage({ data, user, api, notify, reload }) {
               </div>,
               <Badge variant="green">{row.jenis_sampah}</Badge>,
               fmtKg(row.berat_awal),
-              <b className="positive">+ {fmt(row.nilai_setor)}</b>,
+              fmt(kotor),
+              <span className="negative">{fmt(potongan)}</span>,
+              <b className="positive">+ {fmt(nasabahVal)}</b>,
               row.petugas,
             ];
             if (canVoid) {
@@ -300,7 +345,7 @@ export default function SetoranPage({ data, user, api, notify, reload }) {
       <ConfirmDialog
         open={Boolean(voidTarget)}
         title="Batalkan Transaksi Setoran"
-        message={`Batalkan setoran ${voidTarget?.jenis_sampah} ${fmtKg(voidTarget?.berat_awal)} milik ${voidTarget?.nama_nasabah} (${fmt(voidTarget?.nilai_setor)})? Saldo nasabah dan stok sampah akan dikurangi kembali.`}
+        message={`Batalkan setoran ${voidTarget?.jenis_sampah} ${fmtKg(voidTarget?.berat_awal)} milik ${voidTarget?.nama_nasabah} (hak nasabah ${fmt(voidTarget?.nilai_nasabah ?? voidTarget?.nilai_setor)})? Saldo nasabah, kas 10%, dan stok sampah akan disesuaikan kembali.`}
         confirmLabel="Ya, Batalkan Setoran"
         danger
         busy={voiding}

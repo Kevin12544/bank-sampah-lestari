@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   Wallet,
   Search,
@@ -6,6 +6,8 @@ import {
   AlertTriangle,
   SlidersHorizontal,
   Info,
+  Calendar,
+  Sparkles,
 } from 'lucide-react';
 import {
   Badge,
@@ -16,11 +18,12 @@ import {
   Modal,
   ReceiptModal,
 } from '../components/UI.jsx';
-import { dateNow, fmt, fmtDate } from '../utils/format.js';
+import { MONTH_NAMES, dateNow, fmt, fmtDate } from '../utils/format.js';
 
 export default function PenarikanPage({ data, user, api, notify, reload }) {
   const canEditSetting =
     user?.role === 'Ketua' && data.minPenarikan !== undefined;
+
   const [form, setForm] = useState({
     id_nasabah: '',
     tanggal: dateNow(),
@@ -36,13 +39,13 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
   const [voidTarget, setVoidTarget] = useState(null);
   const [voiding, setVoiding] = useState(false);
 
-  // Modal pengaturan batas minimum penarikan
   const [settingOpen, setSettingOpen] = useState(false);
   const [minInput, setMinInput] = useState('');
   const [savingMin, setSavingMin] = useState(false);
 
   const customers = data.customers || [];
   const history = data.history || [];
+  const withdrawnMonths = data.withdrawnMonths || [];
   const minPenarikan =
     data.minPenarikan !== undefined ? Number(data.minPenarikan) : 50000;
 
@@ -50,22 +53,67 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
     (item) => String(item.id_nasabah) === String(form.id_nasabah)
   );
 
+  // H2: Deteksi bulan & tahun dari tanggal penarikan
+  const txYearMonth = String(form.tanggal || dateNow()).slice(0, 7);
+  const [txYearStr, txMonthStr] = txYearMonth.split('-');
+  const txYear = Number(txYearStr || 0);
+  const txMonth = Number(txMonthStr || 0);
+  const isDesember = txMonth === 12;
+  const txMonthLabel = `${MONTH_NAMES[txMonth - 1] || ''} ${txYear}`;
+
+  // H2: Cek apakah nasabah sudah melakukan penarikan pada bulan tersebut (maks. 1x/bulan)
+  const alreadyWithdrawnThisMonth = useMemo(() => {
+    if (!selected || !txYearMonth) return false;
+    const sid = String(selected.id_nasabah);
+    const fromMeta = withdrawnMonths.some(
+      (w) => String(w.id_nasabah) === sid && w.ym === txYearMonth
+    );
+    if (fromMeta) return true;
+    return history.some(
+      (h) =>
+        String(h.id_nasabah) === sid &&
+        String(h.tanggal || '').startsWith(txYearMonth)
+    );
+  }, [selected, txYearMonth, withdrawnMonths, history]);
+
   const saldoTersedia = Number(selected?.saldo || 0);
   const jumlahNum = Number(form.jumlah || 0);
 
+  // H2: Validasi minimum Rp50.000 + pengecualian Desember (boleh tarik seluruh saldo)
+  const noBalance = Boolean(selected && saldoTersedia <= 0);
   const insufficientForMin = Boolean(
-    selected && minPenarikan > 0 && saldoTersedia < minPenarikan
+    selected && !isDesember && minPenarikan > 0 && saldoTersedia < minPenarikan
   );
-  const belowMin = Boolean(
+  const belowMinNonDec = Boolean(
     selected &&
+      !isDesember &&
       !insufficientForMin &&
       minPenarikan > 0 &&
       form.jumlah !== '' &&
       jumlahNum < minPenarikan
   );
-  const exceedsSaldo = Boolean(
-    selected && form.jumlah !== '' && jumlahNum > saldoTersedia
+  const decemberPartialBelowMin = Boolean(
+    selected &&
+      isDesember &&
+      minPenarikan > 0 &&
+      form.jumlah !== '' &&
+      jumlahNum > 0 &&
+      jumlahNum < minPenarikan &&
+      Math.abs(jumlahNum - saldoTersedia) > 0.01
   );
+  const exceedsSaldo = Boolean(
+    selected && form.jumlah !== '' && jumlahNum > saldoTersedia + 0.001
+  );
+
+  const isBlocked =
+    !selected ||
+    alreadyWithdrawnThisMonth ||
+    noBalance ||
+    insufficientForMin ||
+    belowMinNonDec ||
+    decemberPartialBelowMin ||
+    exceedsSaldo ||
+    jumlahNum <= 0;
 
   function openSettingModal() {
     setMinInput(String(minPenarikan));
@@ -100,31 +148,7 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
 
   function handleFormSubmit(e) {
     e.preventDefault();
-    if (saving || !selected) return;
-
-    if (insufficientForMin) {
-      notify(
-        `Saldo nasabah (${fmt(saldoTersedia)}) belum mencapai batas minimum penarikan (${fmt(minPenarikan)}).`,
-        'error'
-      );
-      return;
-    }
-
-    if (!Number.isFinite(jumlahNum) || jumlahNum <= 0) {
-      notify('Masukkan jumlah penarikan lebih dari Rp 0.', 'error');
-      return;
-    }
-
-    if (minPenarikan > 0 && jumlahNum < minPenarikan) {
-      notify(`Nominal penarikan minimal ${fmt(minPenarikan)}.`, 'error');
-      return;
-    }
-
-    if (exceedsSaldo) {
-      notify('Jumlah penarikan melebihi saldo tersedia nasabah.', 'error');
-      return;
-    }
-
+    if (saving || isBlocked) return;
     setConfirmOpen(true);
   }
 
@@ -184,28 +208,38 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
       .includes(search.toLowerCase())
   );
 
-  // Bangun daftar tombol preset valid (>= minPenarikan dan <= saldoTersedia)
+  // Bangun daftar tombol preset valid sesuai aturan H2 (termasuk pengecualian Desember)
   const quickPresets = (() => {
-    if (!selected || saldoTersedia <= 0 || insufficientForMin) return [];
+    if (!selected || saldoTersedia <= 0 || alreadyWithdrawnThisMonth) return [];
+    if (!isDesember && insufficientForMin) return [];
+
     const list = [];
     const seen = new Set();
 
     const addPreset = (label, amount) => {
-      const rounded = Math.floor(amount);
-      if (rounded <= 0 || rounded > saldoTersedia) return;
-      if (minPenarikan > 0 && rounded < minPenarikan) return;
-      if (seen.has(rounded)) return;
-      seen.add(rounded);
-      list.push({ label, amount: rounded });
+      const val = Math.round(amount * 100) / 100;
+      if (val <= 0 || val > saldoTersedia + 0.001) return;
+      if (!isDesember && minPenarikan > 0 && val < minPenarikan) return;
+      if (isDesember && minPenarikan > 0 && val < minPenarikan && Math.abs(val - saldoTersedia) > 0.01) {
+        return;
+      }
+      if (seen.has(val)) return;
+      seen.add(val);
+      list.push({ label, amount: val });
     };
+
+    if (isDesember && saldoTersedia < minPenarikan) {
+      addPreset('Tarik Seluruh Saldo (Desember)', saldoTersedia);
+      return list;
+    }
 
     if (minPenarikan > 0) {
       addPreset('Minimum', minPenarikan);
     }
-    addPreset('25%', saldoTersedia * 0.25);
-    addPreset('50%', saldoTersedia * 0.5);
-    addPreset('75%', saldoTersedia * 0.75);
-    addPreset('Tarik Semua', saldoTersedia);
+    addPreset('25%', Math.floor(saldoTersedia * 0.25));
+    addPreset('50%', Math.floor(saldoTersedia * 0.5));
+    addPreset('75%', Math.floor(saldoTersedia * 0.75));
+    addPreset(isDesember ? 'Tarik Seluruh Saldo (Desember)' : 'Tarik Semua', saldoTersedia);
     return list;
   })();
 
@@ -213,7 +247,7 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
     <div className="page-enter">
       <Heading
         title="Penarikan Saldo"
-        desc="Catat pencairan saldo oleh nasabah. Saldo dan batas minimum divalidasi secara atomik di server."
+        desc="Aturan penarikan: minimal Rp 50.000, maksimal 1 kali per bulan per nasabah, dan pengecualian bulan Desember diperbolehkan tarik seluruh saldo."
         action={
           canEditSetting ? (
             <button
@@ -231,15 +265,31 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
       <div className="transaction-layout">
         <Card>
           <form className="stack-form" onSubmit={handleFormSubmit}>
-            <div className="card-title" style={{ marginBottom: 4 }}>
+            <div className="card-title" style={{ marginBottom: 4, flexWrap: 'wrap' }}>
               <h3>Formulir Penarikan</h3>
-              <Badge variant={minPenarikan > 0 ? 'orange' : 'muted'}>
-                <Info size={12} />
-                {minPenarikan > 0
-                  ? `Min. penarikan ${fmt(minPenarikan)}`
-                  : 'Tanpa batas minimum'}
-              </Badge>
+              <div className="action-row" style={{ flexWrap: 'wrap' }}>
+                <Badge variant={minPenarikan > 0 ? 'orange' : 'muted'}>
+                  <Info size={12} />
+                  {minPenarikan > 0 ? `Min. ${fmt(minPenarikan)}` : 'Tanpa minimum'}
+                </Badge>
+                <Badge variant="blue">
+                  <Calendar size={12} /> Maks. 1× / Bulan
+                </Badge>
+                {isDesember && (
+                  <Badge variant="green">
+                    <Sparkles size={12} /> Pengecualian Desember
+                  </Badge>
+                )}
+              </div>
             </div>
+
+            {isDesember && (
+              <div className="balance-hint" style={{ background: '#e7f7ee', color: '#0e6a3c' }}>
+                <span>
+                  <b>Mode Bulan Desember Aktif:</b> Nasabah diperbolehkan menarik seluruh saldo meskipun saldo di bawah {fmt(minPenarikan)} (tetap maksimal 1× dalam bulan Desember).
+                </span>
+              </div>
+            )}
 
             <div className="form-grid">
               <label>
@@ -273,17 +323,37 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
 
             {selected && (
               <div className="balance-hint">
-                <span>Saldo tersedia ({selected.no_buku})</span>
+                <span>
+                  Saldo tersedia ({selected.no_buku}) · Status {txMonthLabel}:{' '}
+                  <b>{alreadyWithdrawnThisMonth ? 'Sudah menarik 1×' : 'Belum menarik'}</b>
+                </span>
                 <b>{fmt(saldoTersedia)}</b>
               </div>
             )}
 
-            {insufficientForMin && (
+            {alreadyWithdrawnThisMonth && (
+              <div className="inline-error" role="alert">
+                <AlertTriangle size={15} />
+                <span>
+                  <b>Batas Frekuensi Tercapai:</b> {selected.nama} sudah melakukan penarikan pada bulan{' '}
+                  <b>{txMonthLabel}</b>. Penarikan hanya diperbolehkan maksimal 1 kali per bulan.
+                </span>
+              </div>
+            )}
+
+            {!alreadyWithdrawnThisMonth && noBalance && (
+              <div className="inline-error" role="alert">
+                <AlertTriangle size={15} />
+                <span>Saldo nasabah saat ini Rp 0 dan tidak dapat ditarik.</span>
+              </div>
+            )}
+
+            {!alreadyWithdrawnThisMonth && !noBalance && insufficientForMin && (
               <div className="inline-error" role="alert">
                 <AlertTriangle size={15} />
                 <span>
                   Saldo nasabah ({fmt(saldoTersedia)}) belum mencapai batas minimum penarikan sebesar{' '}
-                  <b>{fmt(minPenarikan)}</b>.
+                  <b>{fmt(minPenarikan)}</b>. Pengecualian tarik seluruh saldo hanya berlaku pada bulan Desember.
                 </span>
               </div>
             )}
@@ -292,15 +362,17 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
               Jumlah Penarikan (Rp) *
               <input
                 type="number"
-                min={minPenarikan > 0 ? minPenarikan : 1}
+                min={isDesember ? 1 : minPenarikan > 0 ? minPenarikan : 1}
                 step="any"
                 max={selected ? saldoTersedia : undefined}
-                disabled={insufficientForMin}
+                disabled={alreadyWithdrawnThisMonth || noBalance || insufficientForMin}
                 value={form.jumlah}
                 onChange={(e) => setForm({ ...form, jumlah: e.target.value })}
                 required
                 placeholder={
-                  minPenarikan > 0
+                  isDesember && saldoTersedia > 0 && saldoTersedia < minPenarikan
+                    ? `Desember: tarik seluruh saldo (${fmt(saldoTersedia)})`
+                    : minPenarikan > 0
                     ? `Minimal ${fmt(minPenarikan)}`
                     : 'Masukkan jumlah penarikan'
                 }
@@ -324,17 +396,26 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
               </div>
             )}
 
-            {belowMin && (
+            {!alreadyWithdrawnThisMonth && belowMinNonDec && (
               <div className="inline-error" role="alert">
                 <AlertTriangle size={15} />
                 <span>
                   Nominal penarikan minimal <b>{fmt(minPenarikan)}</b>. Penarikan sebesar{' '}
-                  {fmt(jumlahNum)} tidak diperbolehkan.
+                  {fmt(jumlahNum)} tidak diperbolehkan (kecuali tarik seluruh saldo di bulan Desember).
                 </span>
               </div>
             )}
 
-            {exceedsSaldo && (
+            {!alreadyWithdrawnThisMonth && decemberPartialBelowMin && (
+              <div className="inline-error" role="alert">
+                <AlertTriangle size={15} />
+                <span>
+                  Khusus bulan Desember, penarikan di bawah <b>{fmt(minPenarikan)}</b> hanya diperbolehkan untuk menarik seluruh saldo (<b>{fmt(saldoTersedia)}</b>).
+                </span>
+              </div>
+            )}
+
+            {!alreadyWithdrawnThisMonth && exceedsSaldo && (
               <div className="inline-error" role="alert">
                 <AlertTriangle size={15} />
                 <span>
@@ -355,17 +436,7 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
               />
             </label>
 
-            <button
-              className="primary full"
-              disabled={
-                saving ||
-                !selected ||
-                insufficientForMin ||
-                belowMin ||
-                exceedsSaldo ||
-                jumlahNum <= 0
-              }
-            >
+            <button className="primary full" disabled={saving || isBlocked}>
               <Wallet size={16} />
               {saving ? 'Menyimpan...' : 'Lanjutkan Penarikan'}
             </button>
@@ -380,9 +451,19 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
           <p>Nominal yang akan diserahkan ke nasabah</p>
           <strong>{fmt(jumlahNum)}</strong>
 
-          <div className="summary-projected" style={{ marginBottom: 8 }}>
-            <span>Minimum penarikan aktif</span>
-            <b>{minPenarikan > 0 ? fmt(minPenarikan) : 'Tanpa batas'}</b>
+          <div className="summary-breakdown">
+            <div>
+              <span>Minimum Penarikan</span>
+              <b>{minPenarikan > 0 ? fmt(minPenarikan) : 'Tanpa batas'}</b>
+            </div>
+            <div>
+              <span>Batas Frekuensi</span>
+              <b>Maks. 1× / bulan</b>
+            </div>
+            <div>
+              <span>Status Bulan</span>
+              <b>{isDesember ? 'Desember (Bebas Tarik Semua)' : txMonthLabel}</b>
+            </div>
           </div>
 
           {selected && (
@@ -395,10 +476,7 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
           )}
 
           <div className="summary-note">
-            Penarikan di bawah batas minimum otomatis ditolak oleh sistem (baik di aplikasi maupun server).
-            {canEditSetting && (
-              <> Ketua dapat menyesuaikan batas minimum kapan saja melalui tombol <b>Atur Minimum</b>.</>
-            )}
+            Sistem memvalidasi batas minimum {fmt(minPenarikan)}, frekuensi 1×/bulan, serta pengecualian akhir tahun Desember secara atomik di server.
           </div>
         </Card>
       </div>
@@ -423,7 +501,14 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
           headers={['Tanggal', 'Nasabah', 'Nominal', 'Keterangan', 'Petugas', 'Aksi']}
           emptyText="Belum ada riwayat penarikan."
           rows={filteredHistory.map((row) => [
-            fmtDate(row.tanggal),
+            <div>
+              <span>{fmtDate(row.tanggal)}</span>
+              {row.is_penarikan_desember && (
+                <small className="cell-sub">
+                  <Badge variant="green">Desember</Badge>
+                </small>
+              )}
+            </div>,
             <div>
               <b>{row.nama_nasabah}</b>
               <small className="cell-sub">{row.no_buku}</small>
@@ -447,7 +532,7 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
         open={settingOpen}
         onClose={savingMin ? undefined : () => setSettingOpen(false)}
         title="Pengaturan Minimum Penarikan"
-        subtitle="Atur batas nominal minimal setiap kali nasabah mencairkan saldo. Perubahan langsung berlaku di server."
+        subtitle="Atur batas nominal minimal setiap kali nasabah mencairkan saldo (kecuali bulan Desember)."
         width={460}
       >
         <form className="stack-form" onSubmit={saveMinSetting}>
@@ -501,7 +586,7 @@ export default function PenarikanPage({ data, user, api, notify, reload }) {
       <ConfirmDialog
         open={confirmOpen}
         title="Konfirmasi Pencairan Saldo"
-        message={`Cairkan saldo sebesar ${fmt(jumlahNum)} untuk ${selected?.nama} (${selected?.no_buku})? Sisa saldo setelah penarikan: ${fmt(Math.max(0, saldoTersedia - jumlahNum))}.`}
+        message={`Cairkan saldo sebesar ${fmt(jumlahNum)} untuk ${selected?.nama} (${selected?.no_buku}) pada ${fmtDate(form.tanggal)}? Sisa saldo setelah penarikan: ${fmt(Math.max(0, saldoTersedia - jumlahNum))}.`}
         confirmLabel="Ya, Cairkan Saldo"
         busy={saving}
         onConfirm={executeWithdraw}

@@ -37,6 +37,18 @@ import {
   recordAudit
 } from "./lib/security.js";
 
+import {
+  MONTH_NAMES_ID,
+  POTONGAN_KAS_PERSEN,
+  DEFAULT_MIN_PENARIKAN,
+  PENJUALAN_SIKLUS_HARI,
+  computeSetoranSplit,
+  validatePenarikanRules,
+  computePenjualanItem,
+  computePenjualanSchedule,
+  extractYearMonth
+} from "./lib/rules.js";
+
 dotenv.config();
 
 const { Pool } = pg;
@@ -45,7 +57,6 @@ const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_ISSUER = "bank-sampah-lestari";
 const JWT_EXPIRES_IN = "8h";
-const DEFAULT_MIN_PENARIKAN = 50000;
 
 if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL belum diatur.");
@@ -165,7 +176,7 @@ app.get("/api/health", async (_req, res) => {
     res.json({
       ok: true,
       app: "Bank Sampah Lestari",
-      version: "2.1.2",
+      version: "2.2.0",
       database: "connected",
       timezone: "Asia/Makassar",
       date: today()
@@ -271,36 +282,111 @@ async function notify(
   );
 }
 
+// H1: Pastikan entitas harga_periode tersedia untuk (tahun, bulan) tertentu
+async function ensurePeriodPrices(year, month, db = pool, actorName = "Sistem") {
+  const exec = db === pool ? queryWithRetry : (sql, params) => db.query(sql, params);
+
+  const txCheck = await exec(
+    `SELECT COUNT(*)::int AS cnt
+     FROM transaksi_setor
+     WHERE EXTRACT(YEAR FROM tanggal) = $1
+       AND EXTRACT(MONTH FROM tanggal) = $2`,
+    [year, month]
+  );
+  const hasTransactions = Number(txCheck.rows[0]?.cnt || 0) > 0;
+  const defaultStatus = hasTransactions ? "terkunci" : "draft";
+
+  await exec(
+    `INSERT INTO harga_periode (id_harga, jenis_sampah, bulan, tahun, harga_per_kg, status, ditetapkan_oleh)
+     SELECT
+       h.id_harga,
+       h.jenis_sampah,
+       $1::int AS bulan,
+       $2::int AS tahun,
+       COALESCE(
+         (
+           SELECT hp.harga_per_kg
+           FROM harga_periode hp
+           WHERE hp.id_harga = h.id_harga
+             AND (hp.tahun < $2 OR (hp.tahun = $2 AND hp.bulan < $1))
+           ORDER BY hp.tahun DESC, hp.bulan DESC
+           LIMIT 1
+         ),
+         h.harga_per_kg
+       ) AS harga_per_kg,
+       $3::text AS status,
+       $4::text AS ditetapkan_oleh
+     FROM harga_sampah h
+     WHERE NOT EXISTS (
+       SELECT 1
+       FROM harga_periode existing
+       WHERE existing.id_harga = h.id_harga
+         AND existing.bulan = $1
+         AND existing.tahun = $2
+     )
+     ON CONFLICT (id_harga, bulan, tahun) DO NOTHING`,
+    [month, year, defaultStatus, actorName]
+  );
+
+  // Jika sudah ada transaksi di periode tersebut, pastikan status terkunci
+  if (hasTransactions) {
+    await exec(
+      `UPDATE harga_periode
+       SET status = 'terkunci'
+       WHERE bulan = $1 AND tahun = $2 AND status <> 'terkunci'`,
+      [month, year]
+    );
+  }
+
+  return { hasTransactions, txCount: Number(txCheck.rows[0]?.cnt || 0) };
+}
+
 async function getWasteStock(db = pool) {
   const exec = db === pool ? queryWithRetry : (sql, params) => db.query(sql, params);
-  const { rows } = await exec(`
-    SELECT
-      h.id_harga,
-      h.jenis_sampah,
-      h.harga_per_kg,
-      TO_CHAR(h.tgl_mulai, 'YYYY-MM-DD') AS tgl_mulai,
-      COALESCE(s.berat_masuk, 0) AS berat_masuk,
-      COALESCE(j.berat_keluar, 0) AS berat_keluar,
-      GREATEST(0, COALESCE(s.berat_masuk, 0) - COALESCE(j.berat_keluar, 0)) AS stok_kg
-    FROM harga_sampah h
-    LEFT JOIN (
-      SELECT jenis_sampah, SUM(berat_awal) AS berat_masuk
-      FROM transaksi_setor
-      GROUP BY jenis_sampah
-    ) s ON s.jenis_sampah = h.jenis_sampah
-    LEFT JOIN (
-      SELECT jenis_sampah, SUM(berat_jual) AS berat_keluar
-      FROM transaksi_penjualan
-      GROUP BY jenis_sampah
-    ) j ON j.jenis_sampah = h.jenis_sampah
-    ORDER BY h.id_harga
-  `);
+  const now = witaNowParts();
+  await ensurePeriodPrices(now.year, now.month, db);
+
+  const { rows } = await exec(
+    `SELECT
+       h.id_harga,
+       h.jenis_sampah,
+       COALESCE(hp.harga_per_kg, h.harga_per_kg) AS harga_per_kg,
+       hp.id_periode,
+       COALESCE(hp.status, 'draft') AS status_periode,
+       TO_CHAR(h.tgl_mulai, 'YYYY-MM-DD') AS tgl_mulai,
+       COALESCE(s.berat_masuk, 0) AS berat_masuk,
+       COALESCE(j.berat_keluar_gudang, 0) AS berat_keluar,
+       COALESCE(j.berat_terjual, 0) AS berat_terjual,
+       COALESCE(j.total_susut, 0) AS total_susut_kg,
+       GREATEST(0, COALESCE(s.berat_masuk, 0) - COALESCE(j.berat_keluar_gudang, 0)) AS stok_kg
+     FROM harga_sampah h
+     LEFT JOIN harga_periode hp
+       ON hp.id_harga = h.id_harga AND hp.bulan = $1 AND hp.tahun = $2
+     LEFT JOIN (
+       SELECT jenis_sampah, SUM(berat_awal) AS berat_masuk
+       FROM transaksi_setor
+       GROUP BY jenis_sampah
+     ) s ON s.jenis_sampah = h.jenis_sampah
+     LEFT JOIN (
+       SELECT
+         jenis_sampah,
+         SUM(berat_gudang) AS berat_keluar_gudang,
+         SUM(berat_jual) AS berat_terjual,
+         SUM(berat_susut) AS total_susut
+       FROM detail_penjualan
+       GROUP BY jenis_sampah
+     ) j ON j.jenis_sampah = h.jenis_sampah
+     ORDER BY h.id_harga`,
+    [now.month, now.year]
+  );
 
   return rows.map(row => ({
     ...row,
     harga_per_kg: num(row.harga_per_kg),
     berat_masuk: round3(row.berat_masuk),
     berat_keluar: round3(row.berat_keluar),
+    berat_terjual: round3(row.berat_terjual),
+    total_susut_kg: round3(row.total_susut_kg),
     stok_kg: round3(row.stok_kg)
   }));
 }
@@ -309,12 +395,93 @@ async function getAvailableStockForType(client, jenisSampah) {
   const { rows } = await client.query(
     `SELECT
        COALESCE((SELECT SUM(berat_awal) FROM transaksi_setor WHERE jenis_sampah = $1), 0)
-       - COALESCE((SELECT SUM(berat_jual) FROM transaksi_penjualan WHERE jenis_sampah = $1), 0)
+       - COALESCE((SELECT SUM(berat_gudang) FROM detail_penjualan WHERE jenis_sampah = $1), 0)
        AS stok_kg`,
     [jenisSampah]
   );
 
   return round3(rows[0]?.stok_kg || 0);
+}
+
+async function getPenjualanScheduleStatus(referenceDate = today(), db = pool) {
+  const exec = db === pool ? queryWithRetry : (sql, params) => db.query(sql, params);
+  const { rows } = await exec(
+    `SELECT TO_CHAR(MAX(tanggal), 'YYYY-MM-DD') AS last_sale
+     FROM transaksi_penjualan`
+  );
+  return computePenjualanSchedule(
+    rows[0]?.last_sale || null,
+    referenceDate,
+    PENJUALAN_SIKLUS_HARI
+  );
+}
+
+async function getPenjualanWithDetails(limit = 120) {
+  const headers = await q(
+    `SELECT
+       p.id_penjualan,
+       p.id_pengepul,
+       TO_CHAR(p.tanggal, 'YYYY-MM-DD') AS tanggal,
+       p.jenis_sampah,
+       p.berat_jual,
+       COALESCE(NULLIF(p.total_berat_gudang, 0), p.berat_jual) AS total_berat_gudang,
+       COALESCE(p.total_susut, 0) AS total_susut,
+       p.harga_jual,
+       p.total,
+       p.pembeli,
+       COALESCE(p.catatan, '') AS catatan,
+       COALESCE(p.diluar_jadwal, FALSE) AS diluar_jadwal,
+       p.created_at,
+       g.nama AS nama_pengepul
+     FROM transaksi_penjualan p
+     LEFT JOIN pengepul g ON g.id_pengepul = p.id_pengepul
+     ORDER BY p.tanggal DESC, p.id_penjualan DESC
+     LIMIT $1`,
+    [limit]
+  );
+
+  if (!headers.length) return [];
+
+  const ids = headers.map(h => Number(h.id_penjualan));
+  const details = await q(
+    `SELECT
+       id_detail,
+       id_penjualan,
+       id_harga,
+       jenis_sampah,
+       berat_gudang,
+       berat_jual,
+       berat_susut,
+       harga_jual,
+       subtotal
+     FROM detail_penjualan
+     WHERE id_penjualan = ANY($1::bigint[])
+     ORDER BY id_detail ASC`,
+    [ids]
+  );
+
+  const byParent = new Map();
+  for (const d of details) {
+    const pid = Number(d.id_penjualan);
+    if (!byParent.has(pid)) byParent.set(pid, []);
+    byParent.get(pid).push({
+      ...d,
+      berat_gudang: round3(d.berat_gudang),
+      berat_jual: round3(d.berat_jual),
+      berat_susut: round3(d.berat_susut),
+      harga_jual: round2(d.harga_jual),
+      subtotal: round2(d.subtotal)
+    });
+  }
+
+  return headers.map(h => ({
+    ...h,
+    berat_jual: round3(h.berat_jual),
+    total_berat_gudang: round3(h.total_berat_gudang),
+    total_susut: round3(h.total_susut),
+    total: round2(h.total),
+    items: byParent.get(Number(h.id_penjualan)) || []
+  }));
 }
 
 async function initDb() {
@@ -449,6 +616,31 @@ async function initDb() {
       value TEXT NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS harga_periode (
+      id_periode BIGSERIAL PRIMARY KEY,
+      id_harga BIGINT NOT NULL REFERENCES harga_sampah(id_harga) ON DELETE CASCADE,
+      jenis_sampah TEXT NOT NULL,
+      bulan INTEGER NOT NULL CHECK (bulan BETWEEN 1 AND 12),
+      tahun INTEGER NOT NULL CHECK (tahun BETWEEN 2000 AND 2100),
+      harga_per_kg NUMERIC(16,2) NOT NULL DEFAULT 0 CHECK (harga_per_kg >= 0),
+      status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','terkunci')),
+      ditetapkan_oleh TEXT NOT NULL DEFAULT 'Sistem',
+      ditetapkan_pada TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(id_harga, bulan, tahun)
+    );
+
+    CREATE TABLE IF NOT EXISTS detail_penjualan (
+      id_detail BIGSERIAL PRIMARY KEY,
+      id_penjualan BIGINT NOT NULL REFERENCES transaksi_penjualan(id_penjualan) ON DELETE CASCADE,
+      id_harga BIGINT REFERENCES harga_sampah(id_harga) ON DELETE SET NULL,
+      jenis_sampah TEXT NOT NULL,
+      berat_gudang NUMERIC(16,3) NOT NULL CHECK (berat_gudang > 0),
+      berat_jual NUMERIC(16,3) NOT NULL CHECK (berat_jual > 0),
+      berat_susut NUMERIC(16,3) NOT NULL DEFAULT 0 CHECK (berat_susut >= 0),
+      harga_jual NUMERIC(16,2) NOT NULL CHECK (harga_jual > 0),
+      subtotal NUMERIC(16,2) NOT NULL CHECK (subtotal > 0)
+    );
   `);
 
   await pool.query(
@@ -458,7 +650,7 @@ async function initDb() {
     [String(DEFAULT_MIN_PENARIKAN)]
   );
 
-  // Idempotent schema upgrades for existing production tables
+  // Idempotent schema upgrades for existing production tables (H1–H4)
   await pool.query(`
     ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 1;
@@ -467,19 +659,69 @@ async function initDb() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;
 
     ALTER TABLE transaksi_setor ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    ALTER TABLE transaksi_setor ADD COLUMN IF NOT EXISTS id_periode BIGINT REFERENCES harga_periode(id_periode) ON DELETE SET NULL;
+    ALTER TABLE transaksi_setor ADD COLUMN IF NOT EXISTS nilai_kotor NUMERIC(16,2);
+    ALTER TABLE transaksi_setor ADD COLUMN IF NOT EXISTS persen_potongan NUMERIC(5,2) NOT NULL DEFAULT 10;
+    ALTER TABLE transaksi_setor ADD COLUMN IF NOT EXISTS potongan_kas NUMERIC(16,2) NOT NULL DEFAULT 0;
+    ALTER TABLE transaksi_setor ADD COLUMN IF NOT EXISTS nilai_nasabah NUMERIC(16,2);
+
     ALTER TABLE transaksi_penarikan ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    ALTER TABLE transaksi_penarikan ADD COLUMN IF NOT EXISTS is_penarikan_desember BOOLEAN NOT NULL DEFAULT FALSE;
+
     ALTER TABLE pengepul ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
     ALTER TABLE transaksi_penjualan ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    ALTER TABLE transaksi_penjualan ADD COLUMN IF NOT EXISTS total_berat_gudang NUMERIC(16,3) NOT NULL DEFAULT 0;
+    ALTER TABLE transaksi_penjualan ADD COLUMN IF NOT EXISTS total_susut NUMERIC(16,3) NOT NULL DEFAULT 0;
+    ALTER TABLE transaksi_penjualan ADD COLUMN IF NOT EXISTS catatan TEXT DEFAULT '';
+    ALTER TABLE transaksi_penjualan ADD COLUMN IF NOT EXISTS diluar_jadwal BOOLEAN NOT NULL DEFAULT FALSE;
+
+    ALTER TABLE laporan_bulanan ADD COLUMN IF NOT EXISTS total_potongan_kas NUMERIC(16,2) NOT NULL DEFAULT 0;
+    ALTER TABLE laporan_bulanan ADD COLUMN IF NOT EXISTS total_susut NUMERIC(16,3) NOT NULL DEFAULT 0;
 
     ALTER TABLE notifications ADD COLUMN IF NOT EXISTS audience TEXT NOT NULL DEFAULT 'staff';
     ALTER TABLE notifications ADD COLUMN IF NOT EXISTS id_nasabah BIGINT REFERENCES nasabah(id_nasabah) ON DELETE CASCADE;
     ALTER TABLE notifications ADD COLUMN IF NOT EXISTS is_read BOOLEAN NOT NULL DEFAULT FALSE;
 
+    -- Backfill aman untuk data transaksi_setor lama (pertahankan saldo nasabah historis)
+    UPDATE transaksi_setor
+    SET nilai_kotor = nilai_setor,
+        persen_potongan = 0,
+        potongan_kas = 0,
+        nilai_nasabah = nilai_setor
+    WHERE nilai_kotor IS NULL;
+
+    -- Backfill aman untuk relasi M:N detail_penjualan dari data penjualan lama
+    INSERT INTO detail_penjualan
+      (id_penjualan, id_harga, jenis_sampah, berat_gudang, berat_jual, berat_susut, harga_jual, subtotal)
+    SELECT
+      p.id_penjualan,
+      h.id_harga,
+      p.jenis_sampah,
+      p.berat_jual,
+      p.berat_jual,
+      0,
+      p.harga_jual,
+      p.total
+    FROM transaksi_penjualan p
+    LEFT JOIN harga_sampah h ON h.jenis_sampah = p.jenis_sampah
+    WHERE NOT EXISTS (
+      SELECT 1 FROM detail_penjualan d WHERE d.id_penjualan = p.id_penjualan
+    );
+
+    UPDATE transaksi_penjualan
+    SET total_berat_gudang = berat_jual,
+        total_susut = 0
+    WHERE total_berat_gudang = 0;
+
+    CREATE INDEX IF NOT EXISTS idx_harga_periode_ym ON harga_periode(tahun DESC, bulan DESC);
     CREATE INDEX IF NOT EXISTS idx_setor_tanggal ON transaksi_setor(tanggal DESC);
     CREATE INDEX IF NOT EXISTS idx_setor_nasabah ON transaksi_setor(id_nasabah);
     CREATE INDEX IF NOT EXISTS idx_penarikan_tanggal ON transaksi_penarikan(tanggal DESC);
     CREATE INDEX IF NOT EXISTS idx_penarikan_nasabah ON transaksi_penarikan(id_nasabah);
     CREATE INDEX IF NOT EXISTS idx_penjualan_tanggal ON transaksi_penjualan(tanggal DESC);
+    CREATE INDEX IF NOT EXISTS idx_detail_penjualan_parent ON detail_penjualan(id_penjualan);
+    CREATE INDEX IF NOT EXISTS idx_detail_penjualan_jenis ON detail_penjualan(jenis_sampah);
     CREATE INDEX IF NOT EXISTS idx_notifications_scope ON notifications(audience, id_nasabah, id DESC);
     CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
   `);
@@ -1177,13 +1419,16 @@ app.get(
          FROM nasabah`
       ),
       one(
-        `SELECT COALESCE(SUM(nilai_setor), 0) AS total,
+        `SELECT COALESCE(SUM(COALESCE(nilai_kotor, nilai_setor)), 0) AS total_kotor,
+                COALESCE(SUM(COALESCE(potongan_kas, 0)), 0) AS total_potongan_kas,
+                COALESCE(SUM(COALESCE(nilai_nasabah, nilai_setor)), 0) AS total,
                 COALESCE(SUM(berat_awal), 0) AS berat
          FROM transaksi_setor`
       ),
       one(
         `SELECT COALESCE(SUM(total), 0) AS total,
-                COALESCE(SUM(berat_jual), 0) AS berat
+                COALESCE(SUM(berat_jual), 0) AS berat,
+                COALESCE(SUM(COALESCE(total_susut, 0)), 0) AS total_susut
          FROM transaksi_penjualan`
       ),
       one(
@@ -1274,33 +1519,45 @@ app.get(
     }));
 
     const totalSetor = round2(setor.total);
+    const totalSetorKotor = round2(setor.total_kotor);
+    const kasOperasional = round2(setor.total_potongan_kas);
     const totalPenjualan = round2(penjualan.total);
     const totalPenarikan = round2(penarikan.total);
     const totalSaldoNasabah = round2(nasabah.total_saldo);
-    // Akuntansi kas riil: uang masuk dari penjualan - uang keluar untuk penarikan nasabah
-    const saldoKas = round2(totalPenjualan - totalPenarikan);
-    const marginKotor = round2(totalPenjualan - totalSetor);
+    // H3: Kas Operasional bersumber dari potongan 10% setoran; Arus Kas Penjualan = Penjualan - Penarikan
+    const arusKasPenjualan = round2(totalPenjualan - totalPenarikan);
+    const saldoKas = kasOperasional;
+    const marginKotor = round2(totalPenjualan - totalSetorKotor);
     const totalStokKg = round3(stok.reduce((sum, item) => sum + item.stok_kg, 0));
+    const totalSusutKg = round3(penjualan.total_susut || 0);
+    const schedule = await getPenjualanScheduleStatus();
 
     const chart = stok
       .filter(item => item.berat_masuk > 0 || item.stok_kg > 0)
       .map(item => ({
         jenis: item.jenis_sampah,
         berat: item.berat_masuk,
-        stok: item.stok_kg
+        stok: item.stok_kg,
+        susut: item.total_susut_kg
       }));
 
     res.json({
       nasabah: nasabah.total,
       setor: totalSetor,
+      setorKotor: totalSetorKotor,
+      potonganKasPersen: POTONGAN_KAS_PERSEN,
+      kasOperasional,
       beratSetor: round3(setor.berat),
       penjualan: totalPenjualan,
       beratJual: round3(penjualan.berat),
+      totalSusutKg,
       penarikan: totalPenarikan,
       totalSaldoNasabah,
       saldoKas,
+      arusKasPenjualan,
       marginKotor,
       totalStokKg,
+      schedule,
       stok,
       recent,
       chart,
@@ -1698,16 +1955,27 @@ app.get(
 );
 
 // ===========================
-// HARGA SAMPAH CRUD
+// H1: HARGA SAMPAH & HARGA PERIODE BULANAN
 // ===========================
 
 app.get("/api/harga", auth, async (req, res) => {
+  const now = witaNowParts();
+  await ensurePeriodPrices(now.year, now.month);
+
   if (req.user.role === "Nasabah") {
     const rows = await q(
-      `SELECT id_harga, jenis_sampah, harga_per_kg,
-              TO_CHAR(tgl_mulai, 'YYYY-MM-DD') AS tgl_mulai
-       FROM harga_sampah
-       ORDER BY id_harga`
+      `SELECT
+         h.id_harga,
+         h.jenis_sampah,
+         COALESCE(hp.harga_per_kg, h.harga_per_kg) AS harga_per_kg,
+         hp.bulan,
+         hp.tahun,
+         TO_CHAR(COALESCE(hp.ditetapkan_pada::date, h.tgl_mulai), 'YYYY-MM-DD') AS tgl_mulai
+       FROM harga_sampah h
+       LEFT JOIN harga_periode hp
+         ON hp.id_harga = h.id_harga AND hp.bulan = $1 AND hp.tahun = $2
+       ORDER BY h.id_harga`,
+      [now.month, now.year]
     );
     return res.json(rows);
   }
@@ -1715,6 +1983,222 @@ app.get("/api/harga", auth, async (req, res) => {
   const rows = await getWasteStock();
   res.json(rows);
 });
+
+app.get(
+  "/api/harga-periode",
+  auth,
+  allow("Ketua", "Bendahara", "Petugas Timbang"),
+  async (req, res) => {
+    const now = witaNowParts();
+    const mVal = Number(req.query.month);
+    const yVal = Number(req.query.year);
+    const month = Number.isInteger(mVal) && mVal >= 1 && mVal <= 12 ? mVal : now.month;
+    const year = Number.isInteger(yVal) && yVal >= 2000 && yVal <= 2100 ? yVal : now.year;
+
+    const { hasTransactions, txCount } = await ensurePeriodPrices(year, month);
+
+    const rows = await q(
+      `SELECT
+         hp.id_periode,
+         hp.id_harga,
+         h.jenis_sampah,
+         hp.bulan,
+         hp.tahun,
+         hp.harga_per_kg,
+         hp.status,
+         hp.ditetapkan_oleh,
+         hp.ditetapkan_pada,
+         GREATEST(
+           0,
+           COALESCE(s.berat_masuk, 0) - COALESCE(j.berat_keluar_gudang, 0)
+         ) AS stok_kg
+       FROM harga_periode hp
+       JOIN harga_sampah h ON h.id_harga = hp.id_harga
+       LEFT JOIN (
+         SELECT jenis_sampah, SUM(berat_awal) AS berat_masuk
+         FROM transaksi_setor
+         GROUP BY jenis_sampah
+       ) s ON s.jenis_sampah = h.jenis_sampah
+       LEFT JOIN (
+         SELECT jenis_sampah, SUM(berat_gudang) AS berat_keluar_gudang
+         FROM detail_penjualan
+         GROUP BY jenis_sampah
+       ) j ON j.jenis_sampah = h.jenis_sampah
+       WHERE hp.bulan = $1 AND hp.tahun = $2
+       ORDER BY h.id_harga`,
+      [month, year]
+    );
+
+    const isPastPeriod =
+      year < now.year || (year === now.year && month < now.month);
+    const isLocked =
+      isPastPeriod ||
+      hasTransactions ||
+      rows.some(r => r.status === "terkunci");
+
+    const historyPeriods = await q(`
+      SELECT
+        tahun,
+        bulan,
+        CASE WHEN BOOL_OR(status = 'terkunci') THEN 'terkunci' ELSE 'draft' END AS status,
+        COUNT(*)::int AS jumlah_jenis,
+        MAX(ditetapkan_oleh) AS ditetapkan_oleh,
+        MAX(ditetapkan_pada) AS ditetapkan_pada
+      FROM harga_periode
+      GROUP BY tahun, bulan
+      ORDER BY tahun DESC, bulan DESC
+      LIMIT 24
+    `);
+
+    res.json({
+      month,
+      year,
+      currentMonth: now.month,
+      currentYear: now.year,
+      isPastPeriod,
+      hasTransactions,
+      txCount,
+      isLocked,
+      rows: rows.map(r => ({
+        ...r,
+        harga_per_kg: num(r.harga_per_kg),
+        stok_kg: round3(r.stok_kg)
+      })),
+      historyPeriods
+    });
+  }
+);
+
+app.put(
+  "/api/harga-periode",
+  auth,
+  allow("Ketua", "Bendahara"),
+  async (req, res) => {
+    const now = witaNowParts();
+    const month = Number(req.body?.month);
+    const year = Number(req.body?.year);
+    const items = req.body?.items;
+    const lock = Boolean(req.body?.lock);
+
+    if (
+      !Number.isInteger(month) || month < 1 || month > 12 ||
+      !Number.isInteger(year) || year < 2000 || year > 2100
+    ) {
+      return res.status(400).json({ error: "Periode bulan dan tahun tidak valid." });
+    }
+
+    if (year < now.year || (year === now.year && month < now.month)) {
+      return res.status(400).json({
+        error: "Harga periode bulan yang sudah lewat tidak dapat diubah demi integritas setoran lama."
+      });
+    }
+
+    if (!Array.isArray(items) || !items.length) {
+      return res.status(400).json({ error: "Daftar harga periode wajib diisi." });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const { hasTransactions } = await ensurePeriodPrices(
+        year,
+        month,
+        client,
+        req.user.nama_user
+      );
+
+      const lockedCheck = await client.query(
+        `SELECT COUNT(*)::int AS cnt
+         FROM harga_periode
+         WHERE bulan = $1 AND tahun = $2 AND status = 'terkunci'`,
+        [month, year]
+      );
+
+      const periodName = `${MONTH_NAMES_ID[month - 1]} ${year}`;
+
+      if (hasTransactions || Number(lockedCheck.rows[0]?.cnt || 0) > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: `Harga periode ${periodName} sudah ditetapkan/terkunci dan tidak dapat diubah lagi. Silakan tetapkan harga baru pada periode awal bulan berikutnya.`
+        });
+      }
+
+      const nextStatus = lock ? "terkunci" : "draft";
+      const isCurrentMonth = year === now.year && month === now.month;
+      const changes = [];
+
+      for (const item of items) {
+        const idHarga = parsePositiveInt(item?.id_harga);
+        const priceValue = item?.harga_per_kg;
+        if (
+          !idHarga ||
+          !validNumber(priceValue) ||
+          Number(priceValue) < 0 ||
+          Number(priceValue) > 100_000_000
+        ) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "Terdapat nilai harga yang tidak valid." });
+        }
+
+        const nextPrice = round2(priceValue);
+        const updated = await client.query(
+          `UPDATE harga_periode
+           SET harga_per_kg = $1,
+               status = $2,
+               ditetapkan_oleh = $3,
+               ditetapkan_pada = NOW()
+           WHERE id_harga = $4 AND bulan = $5 AND tahun = $6
+           RETURNING jenis_sampah`,
+          [nextPrice, nextStatus, req.user.nama_user, idHarga, month, year]
+        );
+
+        if (updated.rows.length) {
+          changes.push(`${updated.rows[0].jenis_sampah}: Rp ${formatRupiah(nextPrice)}`);
+          if (isCurrentMonth) {
+            await client.query(
+              "UPDATE harga_sampah SET harga_per_kg = $1, tgl_mulai = $2 WHERE id_harga = $3",
+              [nextPrice, today(), idHarga]
+            );
+          }
+        }
+      }
+
+      await notify(
+        {
+          message: lock
+            ? `Harga sampah periode ${periodName} resmi ditetapkan & dikunci oleh ${req.user.nama_user}.`
+            : `Draft harga sampah periode ${periodName} diperbarui oleh ${req.user.nama_user}.`,
+          type: "info",
+          audience: "staff"
+        },
+        client
+      );
+
+      await recordAudit(client, {
+        req,
+        action: lock ? "HARGA_PERIODE_LOCK" : "HARGA_PERIODE_SET",
+        entity: "harga_periode",
+        entityId: `${year}-${String(month).padStart(2, "0")}`,
+        detail: `Periode ${periodName} (${nextStatus}): ${changes.slice(0, 6).join(", ")}`
+      });
+
+      await client.query("COMMIT");
+
+      res.json({
+        ok: true,
+        message: lock
+          ? `Harga periode ${periodName} berhasil ditetapkan dan dikunci.`
+          : `Draft harga periode ${periodName} berhasil disimpan.`
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+);
 
 app.post(
   "/api/harga",
@@ -1732,21 +2216,46 @@ app.post(
       return res.status(400).json({ error: "Harga per kilogram tidak valid." });
     }
 
+    const now = witaNowParts();
+    const client = await pool.connect();
+
     try {
-      const created = await one(
+      await client.query("BEGIN");
+
+      const createdRes = await client.query(
         `INSERT INTO harga_sampah(jenis_sampah, harga_per_kg, tgl_mulai)
          VALUES($1, $2, $3)
          RETURNING id_harga, jenis_sampah, harga_per_kg, TO_CHAR(tgl_mulai, 'YYYY-MM-DD') AS tgl_mulai`,
         [jenis_sampah, round2(priceValue), today()]
       );
+      const created = createdRes.rows[0];
 
-      await notify({
-        message: `Jenis sampah baru "${jenis_sampah}" ditambahkan dengan harga Rp ${formatRupiah(priceValue)}/kg.`,
-        type: "info",
-        audience: "staff"
-      });
+      // Tambahkan langsung ke harga_periode bulan berjalan agar segera bisa dipakai
+      const lockCheck = await client.query(
+        `SELECT BOOL_OR(status = 'terkunci') AS locked
+         FROM harga_periode
+         WHERE bulan = $1 AND tahun = $2`,
+        [now.month, now.year]
+      );
+      const curStatus = lockCheck.rows[0]?.locked ? "terkunci" : "draft";
 
-      await recordAudit(pool, {
+      await client.query(
+        `INSERT INTO harga_periode(id_harga, jenis_sampah, bulan, tahun, harga_per_kg, status, ditetapkan_oleh)
+         VALUES($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (id_harga, bulan, tahun) DO NOTHING`,
+        [created.id_harga, jenis_sampah, now.month, now.year, round2(priceValue), curStatus, req.user.nama_user]
+      );
+
+      await notify(
+        {
+          message: `Jenis sampah baru "${jenis_sampah}" ditambahkan dengan harga Rp ${formatRupiah(priceValue)}/kg.`,
+          type: "info",
+          audience: "staff"
+        },
+        client
+      );
+
+      await recordAudit(client, {
         req,
         action: "HARGA_CREATE",
         entity: "harga_sampah",
@@ -1754,18 +2263,23 @@ app.post(
         detail: `Tambah jenis sampah "${jenis_sampah}" Rp ${formatRupiah(priceValue)}/kg`
       });
 
+      await client.query("COMMIT");
+
       res.status(201).json({
         ok: true,
         message: "Jenis sampah berhasil ditambahkan.",
         data: created
       });
     } catch (error) {
+      await client.query("ROLLBACK");
       if (error.code === "23505") {
         return res.status(409).json({
           error: "Jenis sampah dengan nama tersebut sudah ada."
         });
       }
       throw error;
+    } finally {
+      client.release();
     }
   }
 );
@@ -1777,6 +2291,13 @@ app.put(
   async (req, res) => {
     const id = parsePositiveInt(req.params.id);
     const priceValue = req.body?.harga_per_kg;
+    const now = witaNowParts();
+    const month = Number.isInteger(Number(req.body?.month)) && Number(req.body?.month) >= 1 && Number(req.body?.month) <= 12
+      ? Number(req.body?.month)
+      : now.month;
+    const year = Number.isInteger(Number(req.body?.year)) && Number(req.body?.year) >= 2000 && Number(req.body?.year) <= 2100
+      ? Number(req.body?.year)
+      : now.year;
 
     if (!id) {
       return res.status(400).json({ error: "ID harga tidak valid." });
@@ -1786,29 +2307,50 @@ app.put(
       return res.status(400).json({ error: "Harga tidak valid." });
     }
 
-    const oldRow = await one(
-      "SELECT id_harga, jenis_sampah, harga_per_kg FROM harga_sampah WHERE id_harga = $1",
-      [id]
+    if (year < now.year || (year === now.year && month < now.month)) {
+      return res.status(400).json({
+        error: "Harga periode bulan lalu tidak dapat diubah."
+      });
+    }
+
+    const { hasTransactions } = await ensurePeriodPrices(year, month);
+    const periodRow = await one(
+      `SELECT id_periode, jenis_sampah, harga_per_kg, status
+       FROM harga_periode
+       WHERE id_harga = $1 AND bulan = $2 AND tahun = $3`,
+      [id, month, year]
     );
 
-    if (!oldRow) {
+    if (!periodRow) {
       return res.status(404).json({
         error: "Data harga sampah tidak ditemukan."
       });
     }
 
+    const periodName = `${MONTH_NAMES_ID[month - 1]} ${year}`;
+    if (hasTransactions || periodRow.status === "terkunci") {
+      return res.status(400).json({
+        error: `Harga periode ${periodName} sudah terkunci. Tetapkan harga baru pada periode awal bulan berikutnya.`
+      });
+    }
+
     const nextPrice = round2(priceValue);
-    const updated = await one(
-      `UPDATE harga_sampah
-       SET harga_per_kg = $1,
-           tgl_mulai = $2
-       WHERE id_harga = $3
-       RETURNING id_harga, jenis_sampah, harga_per_kg, TO_CHAR(tgl_mulai, 'YYYY-MM-DD') AS tgl_mulai`,
-      [nextPrice, today(), id]
+    await q(
+      `UPDATE harga_periode
+       SET harga_per_kg = $1, ditetapkan_oleh = $2, ditetapkan_pada = NOW()
+       WHERE id_periode = $3`,
+      [nextPrice, req.user.nama_user, periodRow.id_periode]
     );
 
+    if (year === now.year && month === now.month) {
+      await q(
+        "UPDATE harga_sampah SET harga_per_kg = $1, tgl_mulai = $2 WHERE id_harga = $3",
+        [nextPrice, today(), id]
+      );
+    }
+
     await notify({
-      message: `Harga ${oldRow.jenis_sampah} diperbarui dari Rp ${formatRupiah(oldRow.harga_per_kg)} menjadi Rp ${formatRupiah(nextPrice)}/kg.`,
+      message: `Draft harga ${periodRow.jenis_sampah} (${periodName}) diubah dari Rp ${formatRupiah(periodRow.harga_per_kg)} menjadi Rp ${formatRupiah(nextPrice)}/kg.`,
       type: "info",
       audience: "staff"
     });
@@ -1816,15 +2358,14 @@ app.put(
     await recordAudit(pool, {
       req,
       action: "HARGA_UPDATE",
-      entity: "harga_sampah",
-      entityId: id,
-      detail: `${oldRow.jenis_sampah}: Rp ${formatRupiah(oldRow.harga_per_kg)} -> Rp ${formatRupiah(nextPrice)}/kg`
+      entity: "harga_periode",
+      entityId: periodRow.id_periode,
+      detail: `${periodRow.jenis_sampah} (${periodName}): Rp ${formatRupiah(periodRow.harga_per_kg)} -> Rp ${formatRupiah(nextPrice)}/kg`
     });
 
     res.json({
       ok: true,
-      message: "Harga sampah berhasil diperbarui.",
-      data: updated
+      message: `Harga ${periodRow.jenis_sampah} periode ${periodName} diperbarui.`
     });
   }
 );
@@ -1850,7 +2391,7 @@ app.delete(
     const used = await one(
       `SELECT
          (SELECT COUNT(*)::int FROM transaksi_setor WHERE id_harga = $1 OR jenis_sampah = $2) AS setor_cnt,
-         (SELECT COUNT(*)::int FROM transaksi_penjualan WHERE jenis_sampah = $2) AS jual_cnt`,
+         (SELECT COUNT(*)::int FROM detail_penjualan WHERE id_harga = $1 OR jenis_sampah = $2) AS jual_cnt`,
       [id, current.jenis_sampah]
     );
 
@@ -1875,7 +2416,7 @@ app.delete(
 );
 
 // ===========================
-// SETORAN SAMPAH
+// H1 & H3: SETORAN SAMPAH (HARGA PERIODE + POTONGAN 10% KAS : 90% NASABAH)
 // ===========================
 
 app.get(
@@ -1887,12 +2428,17 @@ app.get(
       SELECT
         t.id_setor,
         t.id_nasabah,
+        t.id_periode,
         n.no_buku,
         n.nama AS nama_nasabah,
         TO_CHAR(t.tanggal, 'YYYY-MM-DD') AS tanggal,
         t.jenis_sampah,
         t.berat_awal,
         t.harga,
+        COALESCE(t.nilai_kotor, t.nilai_setor) AS nilai_kotor,
+        COALESCE(t.persen_potongan, 0) AS persen_potongan,
+        COALESCE(t.potongan_kas, 0) AS potongan_kas,
+        COALESCE(t.nilai_nasabah, t.nilai_setor) AS nilai_nasabah,
         t.nilai_setor,
         t.petugas,
         t.created_at
@@ -1957,6 +2503,8 @@ app.post(
       });
     }
 
+    const transactionDate = tanggal || today();
+    const { year: txYear, month: txMonth } = extractYearMonth(transactionDate);
     const client = await pool.connect();
 
     try {
@@ -1973,14 +2521,25 @@ app.post(
         return res.status(404).json({ error: "Nasabah tidak ditemukan." });
       }
 
-      let total = 0;
-      const transactionDate = tanggal || today();
+      // H1: Pastikan harga_periode tersedia untuk bulan/tahun transaksi & kunci periode tersebut
+      await ensurePeriodPrices(txYear, txMonth, client, req.user.nama_user);
+
+      let totalKotor = 0;
+      let totalPotonganKas = 0;
+      let totalNasabah = 0;
       const recordedItems = [];
 
       for (const item of validItems) {
         const priceResult = await client.query(
-          "SELECT id_harga, harga_per_kg FROM harga_sampah WHERE jenis_sampah = $1",
-          [item.jenis]
+          `SELECT
+             h.id_harga,
+             hp.id_periode,
+             COALESCE(hp.harga_per_kg, h.harga_per_kg) AS harga_per_kg
+           FROM harga_sampah h
+           LEFT JOIN harga_periode hp
+             ON hp.id_harga = h.id_harga AND hp.bulan = $2 AND hp.tahun = $3
+           WHERE h.jenis_sampah = $1`,
+          [item.jenis, txMonth, txYear]
         );
         const price = priceResult.rows[0];
 
@@ -1988,28 +2547,38 @@ app.post(
           throw new Error(`Harga untuk jenis sampah "${item.jenis}" belum tersedia.`);
         }
 
-        const harga = round2(price.harga_per_kg);
-        const value = round2(item.berat * harga);
+        // H3: Pembagian 10% Kas Operasional : 90% Saldo Nasabah
+        const split = computeSetoranSplit(item.berat, price.harga_per_kg, POTONGAN_KAS_PERSEN);
 
-        if (!Number.isFinite(value) || !Number.isFinite(total + value)) {
+        if (!Number.isFinite(split.nilai_kotor) || !Number.isFinite(totalKotor + split.nilai_kotor)) {
           throw new Error("Perhitungan nilai setoran tidak valid.");
         }
 
-        total = round2(total + value);
+        totalKotor = round2(totalKotor + split.nilai_kotor);
+        totalPotonganKas = round2(totalPotonganKas + split.potongan_kas);
+        totalNasabah = round2(totalNasabah + split.nilai_nasabah);
 
         const inserted = await client.query(
           `INSERT INTO transaksi_setor
-           (id_nasabah, id_harga, tanggal, jenis_sampah, berat_awal, harga, nilai_setor, petugas)
-           VALUES($1, $2, $3, $4, $5, $6, $7, $8)
+           (
+             id_nasabah, id_harga, id_periode, tanggal, jenis_sampah, berat_awal, harga,
+             nilai_kotor, persen_potongan, potongan_kas, nilai_nasabah, nilai_setor, petugas
+           )
+           VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
            RETURNING id_setor`,
           [
             id_nasabah,
             price.id_harga,
+            price.id_periode || null,
             transactionDate,
             item.jenis,
-            item.berat,
-            harga,
-            value,
+            split.berat,
+            split.harga,
+            split.nilai_kotor,
+            split.persen_potongan,
+            split.potongan_kas,
+            split.nilai_nasabah,
+            split.nilai_nasabah,
             req.user.nama_user
           ]
         );
@@ -2017,18 +2586,30 @@ app.post(
         recordedItems.push({
           id_setor: inserted.rows[0].id_setor,
           jenis_sampah: item.jenis,
-          berat: item.berat,
-          harga,
-          nilai: value
+          berat: split.berat,
+          harga: split.harga,
+          nilai_kotor: split.nilai_kotor,
+          potongan_kas: split.potongan_kas,
+          nilai_nasabah: split.nilai_nasabah,
+          nilai: split.nilai_nasabah
         });
       }
 
+      // H1: Kunci harga periode bulan transaksi karena sudah dipakai pada setoran
+      await client.query(
+        `UPDATE harga_periode
+         SET status = 'terkunci'
+         WHERE bulan = $1 AND tahun = $2 AND status <> 'terkunci'`,
+        [txMonth, txYear]
+      );
+
+      // H3: Hanya 90% (totalNasabah) yang masuk menambah saldo nasabah
       const saldoRes = await client.query(
         `UPDATE nasabah
          SET saldo = saldo + $1
          WHERE id_nasabah = $2
          RETURNING saldo`,
-        [total, id_nasabah]
+        [totalNasabah, id_nasabah]
       );
 
       const newSaldo = round2(saldoRes.rows[0].saldo);
@@ -2038,7 +2619,7 @@ app.post(
 
       await notify(
         {
-          message: `Setoran ${customer.nama} (${summaryJenis}) berhasil. Saldo bertambah Rp ${formatRupiah(total)}.`,
+          message: `Setoran ${customer.nama} (${summaryJenis}) berhasil. Kotor Rp ${formatRupiah(totalKotor)} · Kas 10% Rp ${formatRupiah(totalPotonganKas)} · Saldo Nasabah (90%) +Rp ${formatRupiah(totalNasabah)}.`,
           type: "success",
           audience: "all",
           id_nasabah
@@ -2051,22 +2632,30 @@ app.post(
         action: "SETORAN_CREATE",
         entity: "transaksi_setor",
         entityId: recordedItems[0]?.id_setor || "",
-        detail: `${customer.nama} (${customer.no_buku}): ${summaryJenis} = Rp ${formatRupiah(total)}`
+        detail: `${customer.nama} (${customer.no_buku}): ${summaryJenis} | Kotor Rp ${formatRupiah(totalKotor)} | Kas 10% Rp ${formatRupiah(totalPotonganKas)} | Nasabah 90% Rp ${formatRupiah(totalNasabah)}`
       });
 
       await client.query("COMMIT");
 
       res.status(201).json({
         ok: true,
-        total,
+        total: totalNasabah,
+        total_kotor: totalKotor,
+        potongan_kas: totalPotonganKas,
+        total_nasabah: totalNasabah,
         receipt: {
           tipe: "Setoran Sampah",
           tanggal: transactionDate,
+          periode: `${MONTH_NAMES_ID[txMonth - 1]} ${txYear}`,
           no_buku: customer.no_buku,
           nama_nasabah: customer.nama,
           petugas: req.user.nama_user,
           items: recordedItems,
-          total,
+          persen_potongan: POTONGAN_KAS_PERSEN,
+          total_kotor: totalKotor,
+          total_potongan_kas: totalPotonganKas,
+          total_nasabah: totalNasabah,
+          total: totalNasabah,
           saldo_akhir: newSaldo
         }
       });
@@ -2111,7 +2700,6 @@ app.delete(
         return res.status(404).json({ error: "Transaksi setoran tidak ditemukan." });
       }
 
-      // Kunci stok jenis sampah agar konsisten dengan penjualan konkuren
       await client.query(
         "SELECT pg_advisory_xact_lock(hashtext($1))",
         [`stok:${tx.jenis_sampah}`]
@@ -2130,24 +2718,25 @@ app.delete(
         [tx.id_nasabah]
       );
       const customer = custRes.rows[0];
+      const nasabahCredit = round2(tx.nilai_nasabah ?? tx.nilai_setor);
 
-      if (num(customer.saldo) < num(tx.nilai_setor)) {
+      if (num(customer.saldo) < nasabahCredit) {
         await client.query("ROLLBACK");
         return res.status(400).json({
-          error: `Setoran tidak dapat dibatalkan karena saldo ${customer.nama} (Rp ${formatRupiah(customer.saldo)}) lebih kecil dari nilai setoran (Rp ${formatRupiah(tx.nilai_setor)}).`
+          error: `Setoran tidak dapat dibatalkan karena saldo ${customer.nama} (Rp ${formatRupiah(customer.saldo)}) lebih kecil dari hak nasabah pada setoran ini (Rp ${formatRupiah(nasabahCredit)}).`
         });
       }
 
       await client.query(
         "UPDATE nasabah SET saldo = saldo - $1 WHERE id_nasabah = $2",
-        [round2(tx.nilai_setor), tx.id_nasabah]
+        [nasabahCredit, tx.id_nasabah]
       );
 
       await client.query("DELETE FROM transaksi_setor WHERE id_setor = $1", [id]);
 
       await notify(
         {
-          message: `Setoran ${tx.jenis_sampah} ${tx.berat_awal} kg milik ${customer.nama} (Rp ${formatRupiah(tx.nilai_setor)}) dibatalkan oleh ${req.user.nama_user}.`,
+          message: `Setoran ${tx.jenis_sampah} ${tx.berat_awal} kg milik ${customer.nama} (hak nasabah Rp ${formatRupiah(nasabahCredit)}) dibatalkan oleh ${req.user.nama_user}.`,
           type: "warning",
           audience: "all",
           id_nasabah: tx.id_nasabah
@@ -2160,14 +2749,14 @@ app.delete(
         action: "SETORAN_VOID",
         entity: "transaksi_setor",
         entityId: id,
-        detail: `Batalkan setoran #${id} (${customer.nama}, ${tx.jenis_sampah} ${tx.berat_awal} kg, Rp ${formatRupiah(tx.nilai_setor)})`
+        detail: `Batalkan setoran #${id} (${customer.nama}, ${tx.jenis_sampah} ${tx.berat_awal} kg, hak nasabah Rp ${formatRupiah(nasabahCredit)})`
       });
 
       await client.query("COMMIT");
 
       res.json({
         ok: true,
-        message: "Transaksi setoran berhasil dibatalkan dan saldo nasabah telah disesuaikan."
+        message: "Transaksi setoran berhasil dibatalkan dan saldo nasabah serta kas 10% telah disesuaikan."
       });
     } catch (error) {
       await client.query("ROLLBACK");
@@ -2234,7 +2823,7 @@ app.put(
 );
 
 // ===========================
-// PENARIKAN SALDO
+// H2: PENARIKAN SALDO (MIN Rp50.000, MAKS 1x/BULAN, PENGECUALIAN DESEMBER)
 // ===========================
 
 app.get(
@@ -2252,6 +2841,7 @@ app.get(
         p.jumlah,
         p.keterangan,
         p.petugas,
+        COALESCE(p.is_penarikan_desember, FALSE) AS is_penarikan_desember,
         p.created_at
       FROM transaksi_penarikan p
       JOIN nasabah n ON n.id_nasabah = p.id_nasabah
@@ -2286,6 +2876,8 @@ app.post(
       });
     }
 
+    const transactionDate = tanggal || today();
+    const { year: txYear, month: txMonth } = extractYearMonth(transactionDate);
     const client = await pool.connect();
 
     try {
@@ -2304,35 +2896,50 @@ app.post(
 
       const minPenarikan = await getMinPenarikan(client);
 
-      if (minPenarikan > 0 && num(customer.saldo) < minPenarikan) {
+      // H2: Cek frekuensi penarikan pada bulan & tahun transaksi (maks. 1x per bulan)
+      const freqRes = await client.query(
+        `SELECT COUNT(*)::int AS cnt
+         FROM transaksi_penarikan
+         WHERE id_nasabah = $1
+           AND EXTRACT(YEAR FROM tanggal) = $2
+           AND EXTRACT(MONTH FROM tanggal) = $3`,
+        [id_nasabah, txYear, txMonth]
+      );
+      const alreadyWithdrawnThisMonth = Number(freqRes.rows[0]?.cnt || 0);
+
+      const ruleCheck = validatePenarikanRules({
+        amount,
+        saldo: customer.saldo,
+        transactionDate,
+        minPenarikan,
+        alreadyWithdrawnThisMonth
+      });
+
+      if (!ruleCheck.ok) {
         await client.query("ROLLBACK");
-        return res.status(400).json({
-          error: `Saldo nasabah (Rp ${formatRupiah(customer.saldo)}) belum mencapai batas minimum penarikan Rp ${formatRupiah(minPenarikan)}.`
-        });
+        return res.status(400).json({ error: ruleCheck.error });
       }
 
-      if (minPenarikan > 0 && amount < minPenarikan) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          error: `Nominal penarikan minimal Rp ${formatRupiah(minPenarikan)}.`
-        });
-      }
-
-      if (amount > num(customer.saldo)) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          error: `Saldo nasabah tidak mencukupi. Saldo tersedia: Rp ${formatRupiah(customer.saldo)}.`
-        });
-      }
-
-      const transactionDate = tanggal || today();
+      const finalKeterangan =
+        keterangan ||
+        (ruleCheck.isFullDecemberWithdraw
+          ? "Penarikan akhir tahun (pengecualian bulan Desember)"
+          : "");
 
       const inserted = await client.query(
         `INSERT INTO transaksi_penarikan
-         (id_nasabah, id_user, tanggal, jumlah, keterangan, petugas)
-         VALUES($1, $2, $3, $4, $5, $6)
+         (id_nasabah, id_user, tanggal, jumlah, keterangan, petugas, is_penarikan_desember)
+         VALUES($1, $2, $3, $4, $5, $6, $7)
          RETURNING id_penarikan`,
-        [id_nasabah, req.user.id, transactionDate, amount, keterangan, req.user.nama_user]
+        [
+          id_nasabah,
+          req.user.id,
+          transactionDate,
+          amount,
+          finalKeterangan,
+          req.user.nama_user,
+          ruleCheck.isDesember
+        ]
       );
 
       const saldoRes = await client.query(
@@ -2347,7 +2954,7 @@ app.post(
 
       await notify(
         {
-          message: `Penarikan saldo Rp ${formatRupiah(amount)} untuk ${customer.nama} berhasil dicatat.`,
+          message: `Penarikan saldo Rp ${formatRupiah(amount)} untuk ${customer.nama}${ruleCheck.isDesember ? " (Desember)" : ""} berhasil dicatat.`,
           type: "success",
           audience: "all",
           id_nasabah
@@ -2360,7 +2967,7 @@ app.post(
         action: "PENARIKAN_CREATE",
         entity: "transaksi_penarikan",
         entityId: inserted.rows[0].id_penarikan,
-        detail: `${customer.nama} (${customer.no_buku}): Rp ${formatRupiah(amount)}${keterangan ? ` (${keterangan})` : ""}`
+        detail: `${customer.nama} (${customer.no_buku}): Rp ${formatRupiah(amount)}${ruleCheck.isDesember ? " [Pengecualian Desember]" : ""}${finalKeterangan ? ` (${finalKeterangan})` : ""}`
       });
 
       await client.query("COMMIT");
@@ -2375,7 +2982,8 @@ app.post(
           nama_nasabah: customer.nama,
           petugas: req.user.nama_user,
           jumlah: amount,
-          keterangan,
+          keterangan: finalKeterangan,
+          is_penarikan_desember: ruleCheck.isDesember,
           saldo_akhir: saldoSisa
         }
       });
@@ -2592,29 +3200,16 @@ app.delete(
   }
 );
 
+// ===========================
+// H4: PENJUALAN MULTI-ITEM (M:N), STOK GUDANG, SUSUT & SIKLUS 2 MINGGU
+// ===========================
+
 app.get(
   "/api/penjualan",
   auth,
   allow("Ketua", "Bendahara"),
   async (_req, res) => {
-    const rows = await q(`
-      SELECT
-        p.id_penjualan,
-        p.id_pengepul,
-        TO_CHAR(p.tanggal, 'YYYY-MM-DD') AS tanggal,
-        p.jenis_sampah,
-        p.berat_jual,
-        p.harga_jual,
-        p.total,
-        p.pembeli,
-        p.created_at,
-        g.nama AS nama_pengepul
-      FROM transaksi_penjualan p
-      LEFT JOIN pengepul g ON g.id_pengepul = p.id_pengepul
-      ORDER BY p.tanggal DESC, p.id_penjualan DESC
-      LIMIT 120
-    `);
-
+    const rows = await getPenjualanWithDetails(120);
     res.json(rows);
   }
 );
@@ -2625,11 +3220,10 @@ app.post(
   allow("Ketua", "Bendahara"),
   async (req, res) => {
     const idPengepulRaw = req.body?.id_pengepul;
-    const jenis_sampah = cleanText(req.body?.jenis_sampah, 80);
-    const berat_jual = req.body?.berat_jual;
-    const harga_jual = req.body?.harga_jual;
     const pembeli = cleanText(req.body?.pembeli || "", 120);
     const tanggal = cleanText(req.body?.tanggal || "", 10);
+    const catatan = cleanText(req.body?.catatan || "", 300);
+    const diluarJadwalReq = Boolean(req.body?.diluar_jadwal);
 
     let id_pengepul = null;
     if (idPengepulRaw !== undefined && idPengepulRaw !== null && idPengepulRaw !== "") {
@@ -2645,41 +3239,96 @@ app.post(
       });
     }
 
-    if (
-      !jenis_sampah ||
-      !validNumber(berat_jual) ||
-      !validNumber(harga_jual) ||
-      !validDate(tanggal)
-    ) {
+    if (!validDate(tanggal)) {
+      return res.status(400).json({ error: "Format tanggal penjualan tidak valid." });
+    }
+
+    // Dukung payload multi-item M:N (`items[]`) maupun legacy single-item
+    const rawItems = Array.isArray(req.body?.items) && req.body.items.length
+      ? req.body.items
+      : req.body?.jenis_sampah
+        ? [
+            {
+              jenis_sampah: req.body.jenis_sampah,
+              berat_gudang: req.body.berat_gudang ?? req.body.berat_jual,
+              berat_jual: req.body.berat_jual,
+              harga_jual: req.body.harga_jual
+            }
+          ]
+        : [];
+
+    if (!rawItems.length) {
       return res.status(400).json({
-        error: "Lengkapi jenis sampah, berat, harga jual, dan tanggal yang valid."
+        error: "Tambahkan minimal satu jenis sampah yang akan dijual."
       });
     }
 
-    const berat = round3(berat_jual);
-    const harga = round2(harga_jual);
+    const parsedItems = [];
+    const seenJenis = new Set();
 
-    if (berat <= 0 || harga <= 0 || berat > 100_000 || harga > 100_000_000) {
-      return res.status(400).json({
-        error: "Berat dan harga jual harus lebih dari nol dan dalam batas wajar."
+    for (const raw of rawItems) {
+      const jenis_sampah = cleanText(raw?.jenis_sampah, 80);
+      if (!jenis_sampah) {
+        return res.status(400).json({ error: "Jenis sampah pada setiap baris wajib dipilih." });
+      }
+      if (seenJenis.has(jenis_sampah.toLowerCase())) {
+        return res.status(400).json({
+          error: `Jenis sampah "${jenis_sampah}" tidak boleh duplikat dalam satu transaksi penjualan.`
+        });
+      }
+      seenJenis.add(jenis_sampah.toLowerCase());
+
+      const bgInput = raw?.berat_gudang ?? raw?.berat_jual;
+      const bjInput = raw?.berat_jual;
+      const hjInput = raw?.harga_jual;
+
+      if (!validNumber(bgInput) || !validNumber(bjInput) || !validNumber(hjInput)) {
+        return res.status(400).json({
+          error: `Lengkapi berat gudang, berat timbangan pengepul, dan harga jual untuk "${jenis_sampah}".`
+        });
+      }
+
+      const calc = computePenjualanItem({
+        berat_gudang: bgInput,
+        berat_jual: bjInput,
+        harga_jual: hjInput
+      });
+
+      if (!calc.ok) {
+        return res.status(400).json({ error: `${jenis_sampah}: ${calc.error}` });
+      }
+
+      parsedItems.push({
+        jenis_sampah,
+        ...calc
       });
     }
 
-    const total = round2(berat * harga);
-    if (!Number.isFinite(total) || total <= 0) {
-      return res.status(400).json({ error: "Total penjualan tidak valid." });
-    }
-
+    const transactionDate = tanggal || today();
     const client = await pool.connect();
 
     try {
       await client.query("BEGIN");
 
-      // Kunci stok untuk jenis sampah ini selama transaksi berlangsung
-      await client.query(
-        "SELECT pg_advisory_xact_lock(hashtext($1))",
-        [`stok:${jenis_sampah}`]
-      );
+      // Kunci stok secara deterministik (urutan alfabetis) agar bebas deadlock
+      const sortedJenis = [...parsedItems]
+        .map(i => i.jenis_sampah)
+        .sort((a, b) => a.localeCompare(b));
+
+      for (const j of sortedJenis) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`stok:${j}`]);
+      }
+
+      // H4: Cek siklus jadwal 2 mingguan (14 hari)
+      const schedule = await getPenjualanScheduleStatus(transactionDate, client);
+      const isOutsideSchedule = Boolean(schedule.lastSaleDate && !schedule.isDue);
+
+      if (isOutsideSchedule && (!diluarJadwalReq || !catatan)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: `Jadwal penjualan ke pengepul ditetapkan setiap ${PENJUALAN_SIKLUS_HARI} hari (2 minggu). Penjualan terakhir pada ${schedule.lastSaleDate} (jadwal berikutnya ${schedule.nextScheduleDate}). Centang opsi "Penjualan di luar jadwal 2 minggu" dan isi alasan di kolom catatan jika mendesak.`
+        });
+      }
 
       let buyerLabel = pembeli;
       if (id_pengepul) {
@@ -2696,27 +3345,94 @@ app.post(
         }
       }
 
-      const availableStock = await getAvailableStockForType(client, jenis_sampah);
-      if (berat > availableStock + 0.0005) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          error: `Stok ${jenis_sampah} tidak mencukupi. Stok tersedia saat ini: ${availableStock.toLocaleString("id-ID")} kg.`
+      // Validasi stok gudang per jenis (berkurang sebesar berat_gudang) & ambil id_harga
+      const enrichedItems = [];
+      for (const item of parsedItems) {
+        const masterRes = await client.query(
+          "SELECT id_harga FROM harga_sampah WHERE jenis_sampah = $1",
+          [item.jenis_sampah]
+        );
+        const availableStock = await getAvailableStockForType(client, item.jenis_sampah);
+        if (item.berat_gudang > availableStock + 0.0005) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error: `Stok ${item.jenis_sampah} tidak mencukupi. Berat keluar gudang (${item.berat_gudang} kg) melebihi stok tersedia (${availableStock.toLocaleString("id-ID")} kg).`
+          });
+        }
+        enrichedItems.push({
+          ...item,
+          id_harga: masterRes.rows[0]?.id_harga || null
         });
       }
 
-      const transactionDate = tanggal || today();
-
-      const inserted = await client.query(
-        `INSERT INTO transaksi_penjualan
-         (id_pengepul, tanggal, jenis_sampah, berat_jual, harga_jual, total, pembeli)
-         VALUES($1, $2, $3, $4, $5, $6, $7)
-         RETURNING id_penjualan`,
-        [id_pengepul, transactionDate, jenis_sampah, berat, harga, total, pembeli]
+      const totalBeratGudang = round3(
+        enrichedItems.reduce((sum, i) => sum + i.berat_gudang, 0)
       );
+      const totalBeratJual = round3(
+        enrichedItems.reduce((sum, i) => sum + i.berat_jual, 0)
+      );
+      const totalSusut = round3(
+        enrichedItems.reduce((sum, i) => sum + i.berat_susut, 0)
+      );
+      const grandTotal = round2(
+        enrichedItems.reduce((sum, i) => sum + i.subtotal, 0)
+      );
+      const avgPrice = round2(grandTotal / totalBeratJual);
+      const summaryJenis = enrichedItems.map(i => i.jenis_sampah).join(", ");
+
+      const insertedHeader = await client.query(
+        `INSERT INTO transaksi_penjualan
+         (
+           id_pengepul, tanggal, jenis_sampah, berat_jual, total_berat_gudang,
+           total_susut, harga_jual, total, pembeli, catatan, diluar_jadwal
+         )
+         VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         RETURNING id_penjualan`,
+        [
+          id_pengepul,
+          transactionDate,
+          summaryJenis,
+          totalBeratJual,
+          totalBeratGudang,
+          totalSusut,
+          avgPrice,
+          grandTotal,
+          pembeli,
+          catatan,
+          isOutsideSchedule
+        ]
+      );
+
+      const saleId = insertedHeader.rows[0].id_penjualan;
+
+      for (const item of enrichedItems) {
+        await client.query(
+          `INSERT INTO detail_penjualan
+           (id_penjualan, id_harga, jenis_sampah, berat_gudang, berat_jual, berat_susut, harga_jual, subtotal)
+           VALUES($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [
+            saleId,
+            item.id_harga,
+            item.jenis_sampah,
+            item.berat_gudang,
+            item.berat_jual,
+            item.berat_susut,
+            item.harga_jual,
+            item.subtotal
+          ]
+        );
+      }
+
+      const itemSummaryText = enrichedItems
+        .map(
+          i =>
+            `${i.jenis_sampah} (gudang ${i.berat_gudang} kg → jual ${i.berat_jual} kg, susut ${i.berat_susut} kg)`
+        )
+        .join("; ");
 
       await notify(
         {
-          message: `Penjualan ${berat} kg ${jenis_sampah} ke ${buyerLabel} senilai Rp ${formatRupiah(total)} berhasil dicatat.`,
+          message: `Penjualan #${saleId} ke ${buyerLabel} (${summaryJenis}, terjual ${totalBeratJual} kg, susut ${totalSusut} kg) senilai Rp ${formatRupiah(grandTotal)} berhasil dicatat.`,
           type: "success",
           audience: "staff"
         },
@@ -2727,16 +3443,20 @@ app.post(
         req,
         action: "PENJUALAN_CREATE",
         entity: "transaksi_penjualan",
-        entityId: inserted.rows[0].id_penjualan,
-        detail: `${berat} kg ${jenis_sampah} @ Rp ${formatRupiah(harga)} = Rp ${formatRupiah(total)} (${buyerLabel})`
+        entityId: saleId,
+        detail: `${buyerLabel}: ${itemSummaryText} | Total Rp ${formatRupiah(grandTotal)}${isOutsideSchedule ? ` [Di luar jadwal 2 minggu: ${catatan}]` : ""}`
       });
 
       await client.query("COMMIT");
 
       res.status(201).json({
         ok: true,
-        id_penjualan: inserted.rows[0].id_penjualan,
-        total
+        id_penjualan: saleId,
+        total: grandTotal,
+        total_berat_gudang: totalBeratGudang,
+        total_berat_jual: totalBeratJual,
+        total_susut: totalSusut,
+        items: enrichedItems
       });
     } catch (error) {
       await client.query("ROLLBACK");
@@ -2839,11 +3559,14 @@ app.get(
       detailJual,
       saldoNasabah,
       stok,
-      transaksi
+      transaksi,
+      hargaPeriode
     ] = await Promise.all([
       one(
         `SELECT
-           COALESCE(SUM(nilai_setor), 0) AS total,
+           COALESCE(SUM(COALESCE(nilai_kotor, nilai_setor)), 0) AS total_kotor,
+           COALESCE(SUM(COALESCE(potongan_kas, 0)), 0) AS potongan_kas,
+           COALESCE(SUM(COALESCE(nilai_nasabah, nilai_setor)), 0) AS total,
            COALESCE(SUM(berat_awal), 0) AS berat,
            COUNT(*)::int AS jumlah_transaksi
          FROM transaksi_setor
@@ -2861,7 +3584,9 @@ app.get(
       one(
         `SELECT
            COALESCE(SUM(total), 0) AS total,
+           COALESCE(SUM(COALESCE(NULLIF(total_berat_gudang, 0), berat_jual)), 0) AS berat_gudang,
            COALESCE(SUM(berat_jual), 0) AS berat,
+           COALESCE(SUM(COALESCE(total_susut, 0)), 0) AS total_susut,
            COUNT(*)::int AS jumlah_transaksi
          FROM transaksi_penjualan
          WHERE tanggal BETWEEN $1 AND $2`,
@@ -2871,21 +3596,26 @@ app.get(
         `SELECT
            jenis_sampah AS jenis,
            SUM(berat_awal) AS berat,
-           SUM(nilai_setor) AS total
+           SUM(COALESCE(nilai_kotor, nilai_setor)) AS kotor,
+           SUM(COALESCE(potongan_kas, 0)) AS potongan_kas,
+           SUM(COALESCE(nilai_nasabah, nilai_setor)) AS total
          FROM transaksi_setor
          WHERE tanggal BETWEEN $1 AND $2
          GROUP BY jenis_sampah
-         ORDER BY total DESC`,
+         ORDER BY kotor DESC`,
         [start, end]
       ),
       q(
         `SELECT
-           jenis_sampah AS jenis,
-           SUM(berat_jual) AS berat,
-           SUM(total) AS total
-         FROM transaksi_penjualan
-         WHERE tanggal BETWEEN $1 AND $2
-         GROUP BY jenis_sampah
+           d.jenis_sampah AS jenis,
+           SUM(d.berat_gudang) AS berat_gudang,
+           SUM(d.berat_jual) AS berat,
+           SUM(d.berat_susut) AS berat_susut,
+           SUM(d.subtotal) AS total
+         FROM detail_penjualan d
+         JOIN transaksi_penjualan p ON p.id_penjualan = d.id_penjualan
+         WHERE p.tanggal BETWEEN $1 AND $2
+         GROUP BY d.jenis_sampah
          ORDER BY total DESC`,
         [start, end]
       ),
@@ -2899,7 +3629,9 @@ app.get(
              n.nama AS pihak,
              t.jenis_sampah AS kategori,
              t.berat_awal AS berat,
-             t.nilai_setor AS nominal,
+             COALESCE(t.nilai_kotor, t.nilai_setor) AS nilai_kotor,
+             COALESCE(t.potongan_kas, 0) AS potongan_kas,
+             COALESCE(t.nilai_nasabah, t.nilai_setor) AS nominal,
              t.petugas AS petugas
            FROM transaksi_setor t
            JOIN nasabah n ON n.id_nasabah = t.id_nasabah
@@ -2913,6 +3645,8 @@ app.get(
              n.nama AS pihak,
              COALESCE(NULLIF(p.keterangan, ''), 'Penarikan saldo') AS kategori,
              0 AS berat,
+             p.jumlah AS nilai_kotor,
+             0 AS potongan_kas,
              p.jumlah AS nominal,
              p.petugas AS petugas
            FROM transaksi_penarikan p
@@ -2927,6 +3661,8 @@ app.get(
              COALESCE(g.nama, NULLIF(j.pembeli, ''), 'Pengepul') AS pihak,
              j.jenis_sampah AS kategori,
              j.berat_jual AS berat,
+             j.total AS nilai_kotor,
+             0 AS potongan_kas,
              j.total AS nominal,
              '-' AS petugas
            FROM transaksi_penjualan j
@@ -2935,6 +3671,13 @@ app.get(
          ) ledger
          ORDER BY tanggal DESC`,
         [start, end]
+      ),
+      q(
+        `SELECT jenis_sampah, harga_per_kg, status, ditetapkan_oleh
+         FROM harga_periode
+         WHERE bulan = $1 AND tahun = $2
+         ORDER BY id_harga`,
+        [month, year]
       )
     ]);
 
@@ -2945,18 +3688,31 @@ app.get(
     if (ketua) {
       await q(
         `INSERT INTO laporan_bulanan
-         (id_ketua, bulan, tahun, total_setor, total_penarikan, total_penjualan)
-         VALUES($1, $2, $3, $4, $5, $6)
+         (id_ketua, bulan, tahun, total_setor, total_potongan_kas, total_penarikan, total_penjualan, total_susut)
+         VALUES($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT(id_ketua, bulan, tahun)
          DO UPDATE SET
            total_setor = EXCLUDED.total_setor,
+           total_potongan_kas = EXCLUDED.total_potongan_kas,
            total_penarikan = EXCLUDED.total_penarikan,
-           total_penjualan = EXCLUDED.total_penjualan`,
-        [ketua.id_ketua, month, year, setor.total, tarik.total, jual.total]
+           total_penjualan = EXCLUDED.total_penjualan,
+           total_susut = EXCLUDED.total_susut`,
+        [
+          ketua.id_ketua,
+          month,
+          year,
+          setor.total_kotor,
+          setor.potongan_kas,
+          tarik.total,
+          jual.total,
+          jual.total_susut
+        ]
       );
     }
 
-    const totalSetor = round2(setor.total);
+    const totalSetorKotor = round2(setor.total_kotor);
+    const totalPotonganKas = round2(setor.potongan_kas);
+    const totalSetorNasabah = round2(setor.total);
     const totalTarik = round2(tarik.total);
     const totalJual = round2(jual.total);
 
@@ -2964,8 +3720,12 @@ app.get(
       month,
       year,
       ketuaNama: ketua?.nama || "Ketua Bank Sampah Lestari",
+      potonganKasPersen: POTONGAN_KAS_PERSEN,
       setor: {
-        total: totalSetor,
+        total: totalSetorNasabah,
+        totalKotor: totalSetorKotor,
+        potonganKas: totalPotonganKas,
+        totalNasabah: totalSetorNasabah,
         berat: round3(setor.berat),
         jumlah_transaksi: setor.jumlah_transaksi
       },
@@ -2975,22 +3735,30 @@ app.get(
       },
       jual: {
         total: totalJual,
+        beratGudang: round3(jual.berat_gudang),
         berat: round3(jual.berat),
+        totalSusut: round3(jual.total_susut),
         jumlah_transaksi: jual.jumlah_transaksi
       },
+      kasOperasionalPeriode: totalPotonganKas,
       arusKasPeriode: round2(totalJual - totalTarik),
-      estimasiMargin: round2(totalJual - totalSetor),
+      estimasiMargin: round2(totalJual - totalSetorKotor),
       totalSaldoNasabah: round2(saldoNasabah.total),
       detail: detail.map(d => ({
         jenis: d.jenis,
         berat: round3(d.berat),
+        kotor: round2(d.kotor),
+        potongan_kas: round2(d.potongan_kas),
         total: round2(d.total)
       })),
       detailJual: detailJual.map(d => ({
         jenis: d.jenis,
+        berat_gudang: round3(d.berat_gudang),
         berat: round3(d.berat),
+        berat_susut: round3(d.berat_susut),
         total: round2(d.total)
       })),
+      hargaPeriode,
       stok,
       transaksi
     });
@@ -3111,13 +3879,22 @@ app.get(
   auth,
   allow("Nasabah"),
   async (req, res) => {
+    const now = witaNowParts();
+    await ensurePeriodPrices(now.year, now.month);
+
     const [customer, prices, minPenarikan] = await Promise.all([
       one("SELECT * FROM nasabah WHERE id_user = $1", [req.user.id]),
       q(
-        `SELECT id_harga, jenis_sampah, harga_per_kg,
-                TO_CHAR(tgl_mulai, 'YYYY-MM-DD') AS tgl_mulai
-         FROM harga_sampah
-         ORDER BY id_harga`
+        `SELECT
+           h.id_harga,
+           h.jenis_sampah,
+           COALESCE(hp.harga_per_kg, h.harga_per_kg) AS harga_per_kg,
+           TO_CHAR(COALESCE(hp.ditetapkan_pada::date, h.tgl_mulai), 'YYYY-MM-DD') AS tgl_mulai
+         FROM harga_sampah h
+         LEFT JOIN harga_periode hp
+           ON hp.id_harga = h.id_harga AND hp.bulan = $1 AND hp.tahun = $2
+         ORDER BY h.id_harga`,
+        [now.month, now.year]
       ),
       getMinPenarikan()
     ]);
@@ -3128,7 +3905,11 @@ app.get(
         items: [],
         summary: { totalSetor: 0, totalTarik: 0, totalBeratKg: 0, jumlahTransaksi: 0 },
         prices,
-        minPenarikan
+        minPenarikan,
+        sudahTarikBulanIni: false,
+        isDesember: now.month === 12,
+        potonganKasPersen: POTONGAN_KAS_PERSEN,
+        periodeLabel: `${MONTH_NAMES_ID[now.month - 1]} ${now.year}`
       });
     }
 
@@ -3139,7 +3920,9 @@ app.get(
          created_at,
          jenis_sampah,
          berat_awal AS berat,
-         nilai_setor AS nilai,
+         COALESCE(nilai_kotor, nilai_setor) AS nilai_kotor,
+         COALESCE(potongan_kas, 0) AS potongan_kas,
+         COALESCE(nilai_nasabah, nilai_setor) AS nilai,
          petugas,
          '' AS keterangan,
          'Setoran' AS tipe
@@ -3154,6 +3937,8 @@ app.get(
          created_at,
          '-' AS jenis_sampah,
          0 AS berat,
+         jumlah AS nilai_kotor,
+         0 AS potongan_kas,
          jumlah AS nilai,
          petugas,
          keterangan,
@@ -3163,6 +3948,11 @@ app.get(
 
        ORDER BY tanggal DESC, created_at DESC, id DESC`,
       [customer.id_nasabah]
+    );
+
+    const ymNow = `${now.year}-${String(now.month).padStart(2, "0")}`;
+    const sudahTarikBulanIni = items.some(
+      i => i.tipe === "Penarikan" && String(i.tanggal || "").startsWith(ymNow)
     );
 
     const summary = items.reduce(
@@ -3184,7 +3974,11 @@ app.get(
       items,
       summary,
       prices,
-      minPenarikan
+      minPenarikan,
+      sudahTarikBulanIni,
+      isDesember: now.month === 12,
+      potonganKasPersen: POTONGAN_KAS_PERSEN,
+      periodeLabel: `${MONTH_NAMES_ID[now.month - 1]} ${now.year}`
     });
   }
 );
@@ -3198,6 +3992,7 @@ app.get(
   auth,
   allow("Ketua", "Bendahara", "Petugas Timbang"),
   async (_req, res) => {
+    const now = witaNowParts();
     const customers = await q(
       "SELECT id_nasabah, no_buku, nama, saldo FROM nasabah ORDER BY nama ASC"
     );
@@ -3206,12 +4001,17 @@ app.get(
       SELECT
         t.id_setor,
         t.id_nasabah,
+        t.id_periode,
         n.no_buku,
         n.nama AS nama_nasabah,
         TO_CHAR(t.tanggal, 'YYYY-MM-DD') AS tanggal,
         t.jenis_sampah,
         t.berat_awal,
         t.harga,
+        COALESCE(t.nilai_kotor, t.nilai_setor) AS nilai_kotor,
+        COALESCE(t.persen_potongan, 0) AS persen_potongan,
+        COALESCE(t.potongan_kas, 0) AS potongan_kas,
+        COALESCE(t.nilai_nasabah, t.nilai_setor) AS nilai_nasabah,
         t.nilai_setor,
         t.petugas,
         t.created_at
@@ -3220,7 +4020,13 @@ app.get(
       ORDER BY t.tanggal DESC, t.id_setor DESC
       LIMIT 120
     `);
-    res.json({ customers, prices, history });
+    res.json({
+      customers,
+      prices,
+      history,
+      potonganKasPersen: POTONGAN_KAS_PERSEN,
+      periodeLabel: `${MONTH_NAMES_ID[now.month - 1]} ${now.year}`
+    });
   }
 );
 
@@ -3242,14 +4048,21 @@ app.get(
         p.jumlah,
         p.keterangan,
         p.petugas,
+        COALESCE(p.is_penarikan_desember, FALSE) AS is_penarikan_desember,
         p.created_at
       FROM transaksi_penarikan p
       JOIN nasabah n ON n.id_nasabah = p.id_nasabah
       ORDER BY p.tanggal DESC, p.id_penarikan DESC
       LIMIT 120
     `);
+    const withdrawnMonths = await q(`
+      SELECT DISTINCT
+        id_nasabah,
+        TO_CHAR(tanggal, 'YYYY-MM') AS ym
+      FROM transaksi_penarikan
+    `);
     const minPenarikan = await getMinPenarikan();
-    res.json({ customers, history, minPenarikan });
+    res.json({ customers, history, minPenarikan, withdrawnMonths });
   }
 );
 
@@ -3258,26 +4071,11 @@ app.get(
   auth,
   allow("Ketua", "Bendahara"),
   async (_req, res) => {
-    const rows = await q(`
-      SELECT
-        p.id_penjualan,
-        p.id_pengepul,
-        TO_CHAR(p.tanggal, 'YYYY-MM-DD') AS tanggal,
-        p.jenis_sampah,
-        p.berat_jual,
-        p.harga_jual,
-        p.total,
-        p.pembeli,
-        p.created_at,
-        g.nama AS nama_pengepul
-      FROM transaksi_penjualan p
-      LEFT JOIN pengepul g ON g.id_pengepul = p.id_pengepul
-      ORDER BY p.tanggal DESC, p.id_penjualan DESC
-      LIMIT 120
-    `);
+    const rows = await getPenjualanWithDetails(120);
     const prices = await getWasteStock();
     const collectors = await q("SELECT * FROM pengepul ORDER BY nama ASC");
-    res.json({ rows, prices, collectors });
+    const schedule = await getPenjualanScheduleStatus();
+    res.json({ rows, prices, collectors, schedule });
   }
 );
 

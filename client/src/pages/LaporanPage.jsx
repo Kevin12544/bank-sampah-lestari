@@ -40,13 +40,25 @@ export default function LaporanPage({ data, api, setData, notify }) {
     const monthLabel = MONTH_NAMES[(data.month || month) - 1] || month;
     exportCsv(
       `laporan-bank-sampah-lestari-${monthLabel.toLowerCase()}-${data.year || year}.csv`,
-      ['Tanggal', 'Tipe', 'Pihak / Nasabah', 'Kategori / Keterangan', 'Berat (kg)', 'Nominal (Rp)', 'Petugas'],
+      [
+        'Tanggal',
+        'Tipe',
+        'Pihak / Nasabah',
+        'Kategori / Keterangan',
+        'Berat (kg)',
+        'Nilai Kotor (Rp)',
+        'Potongan Kas 10% (Rp)',
+        'Nominal Bersih (Rp)',
+        'Petugas',
+      ],
       ledger.map((row) => [
         row.tanggal,
         row.tipe,
         row.pihak,
         row.kategori,
         Number(row.berat || 0),
+        Number(row.nilai_kotor ?? row.nominal ?? 0),
+        Number(row.potongan_kas ?? 0),
         Number(row.nominal || 0),
         row.petugas || '-',
       ])
@@ -55,12 +67,13 @@ export default function LaporanPage({ data, api, setData, notify }) {
   }
 
   const periodTitle = `${MONTH_NAMES[(data.month || month) - 1] || ''} ${data.year || year}`;
+  const kasOps = data.kasOperasionalPeriode ?? data.setor?.potonganKas ?? 0;
 
   return (
     <div className="page-enter">
       <Heading
-        title="Laporan Bulanan"
-        desc="Rangkuman setoran, penarikan, penjualan, arus kas, dan stok untuk periode yang dipilih."
+        title="Laporan Bulanan & Kas Operasional"
+        desc="Rangkuman setoran (10% Kas : 90% Nasabah), penarikan, penjualan multi-item & susut, serta tarif periode berlaku."
         action={
           <>
             <button
@@ -84,7 +97,7 @@ export default function LaporanPage({ data, api, setData, notify }) {
 
       <div className="print-letterhead">
         <h2>BANK SAMPAH LESTARI</h2>
-        <p>Laporan Operasional &amp; Keuangan Bulanan — Periode {periodTitle}</p>
+        <p>Laporan Operasional, Kas 10%, &amp; Susut Bulanan — Periode {periodTitle}</p>
         <small>Dicetak pada {fmtDate(dateNow())}</small>
       </div>
 
@@ -128,75 +141,103 @@ export default function LaporanPage({ data, api, setData, notify }) {
 
         <div className="report-stats">
           <div>
+            <small>Kas Operasional (Potongan 10%)</small>
+            <b className="positive">{fmt(kasOps)}</b>
+            <span>sumber utama kas operasional bank sampah</span>
+          </div>
+
+          <div>
             <small>Total Setoran ({data.setor?.jumlah_transaksi || 0} trx)</small>
-            <b>{fmt(data.setor?.total)}</b>
-            <span>{fmtKg(data.setor?.berat || 0)}</span>
+            <b>{fmt(data.setor?.totalKotor ?? data.setor?.total)}</b>
+            <span>
+              {fmtKg(data.setor?.berat || 0)} · Hak Nasabah 90%: {fmt(data.setor?.totalNasabah ?? data.setor?.total)}
+            </span>
           </div>
 
           <div>
             <small>Total Penarikan ({data.tarik?.jumlah_transaksi || 0} trx)</small>
             <b className="negative">{fmt(data.tarik?.total)}</b>
-            <span>pencairan nasabah</span>
+            <span>pencairan saldo anggota</span>
           </div>
 
           <div>
             <small>Total Penjualan ({data.jual?.jumlah_transaksi || 0} trx)</small>
             <b>{fmt(data.jual?.total)}</b>
-            <span>{fmtKg(data.jual?.berat || 0)}</span>
+            <span>
+              Gudang {fmtKg(data.jual?.beratGudang ?? data.jual?.berat)} → Jual {fmtKg(data.jual?.berat || 0)}
+            </span>
           </div>
 
           <div>
-            <small>Arus Kas Periode</small>
-            <b className={Number(data.arusKasPeriode || 0) >= 0 ? 'positive' : 'negative'}>
-              {fmt(data.arusKasPeriode)}
+            <small>Total Selisih Susut Periode</small>
+            <b className={Number(data.jual?.totalSusut || 0) > 0 ? 'negative' : ''}>
+              {fmtKg(data.jual?.totalSusut || 0)}
             </b>
-            <span>penjualan − penarikan</span>
-          </div>
-
-          <div>
-            <small>Estimasi Margin Periode</small>
-            <b className={Number(data.estimasiMargin || 0) >= 0 ? 'positive' : 'negative'}>
-              {fmt(data.estimasiMargin)}
-            </b>
-            <span>penjualan − setoran</span>
+            <span>selisih berat gudang vs timbangan pengepul</span>
           </div>
 
           <div>
             <small>Total Kewajiban Saldo Nasabah</small>
             <b>{fmt(data.totalSaldoNasabah)}</b>
-            <span>akumulasi seluruh anggota</span>
+            <span>arus jual − tarik periode: {fmt(data.arusKasPeriode)}</span>
           </div>
         </div>
 
         <div className="two-col" style={{ marginTop: 18 }}>
           <div>
-            <h3 className="sub-heading">Rincian Setoran per Jenis</h3>
+            <h3 className="sub-heading">Rincian Setoran (10% Kas : 90% Nasabah)</h3>
             <DataTable
               pageSize={0}
-              headers={['Jenis Sampah', 'Berat', 'Total Nilai']}
+              headers={['Jenis', 'Berat', 'Kotor (100%)', 'Kas (10%)', 'Nasabah (90%)']}
               emptyText="Tidak ada setoran pada periode ini."
               rows={(data.detail || []).map((item) => [
                 <b>{item.jenis}</b>,
                 fmtKg(item.berat),
-                fmt(item.total),
+                fmt(item.kotor ?? item.total),
+                <span className="negative">{fmt(item.potongan_kas ?? 0)}</span>,
+                <b className="positive">{fmt(item.total)}</b>,
               ])}
             />
           </div>
 
           <div>
-            <h3 className="sub-heading">Rincian Penjualan per Jenis</h3>
+            <h3 className="sub-heading">Rincian Penjualan &amp; Susut per Jenis</h3>
             <DataTable
               pageSize={0}
-              headers={['Jenis Sampah', 'Berat Terjual', 'Total Penjualan']}
+              headers={['Jenis', 'Gudang', 'Jual', 'Susut', 'Total']}
               emptyText="Tidak ada penjualan pada periode ini."
               rows={(data.detailJual || []).map((item) => [
                 <b>{item.jenis}</b>,
+                fmtKg(item.berat_gudang ?? item.berat),
                 fmtKg(item.berat),
-                fmt(item.total),
+                <span className={Number(item.berat_susut || 0) > 0 ? 'negative' : ''}>
+                  {fmtKg(item.berat_susut || 0)}
+                </span>,
+                <b className="positive">{fmt(item.total)}</b>,
               ])}
             />
           </div>
         </div>
+
+        {(data.hargaPeriode || []).length > 0 && (
+          <div style={{ marginTop: 22 }}>
+            <h3 className="sub-heading">
+              Snapshot HargaPeriode Berlaku — {periodTitle}
+            </h3>
+            <DataTable
+              pageSize={0}
+              headers={['Jenis Sampah', 'Harga/kg', 'Status', 'Ditetapkan Oleh']}
+              rows={(data.hargaPeriode || []).map((hp) => [
+                <b>{hp.jenis_sampah}</b>,
+                fmt(hp.harga_per_kg),
+                <Badge variant={hp.status === 'terkunci' ? 'orange' : 'green'}>
+                  {hp.status === 'terkunci' ? 'Terkunci' : 'Draft'}
+                </Badge>,
+                hp.ditetapkan_oleh || 'Sistem',
+              ])}
+            />
+          </div>
+        )}
 
         <h3 className="sub-heading" style={{ marginTop: 22 }}>
           Buku Transaksi Periode {periodTitle} ({(data.transaksi || []).length})
@@ -204,7 +245,7 @@ export default function LaporanPage({ data, api, setData, notify }) {
 
         <DataTable
           pageSize={15}
-          headers={['Tanggal', 'Tipe', 'Pihak / Nasabah', 'Detail', 'Berat', 'Nominal']}
+          headers={['Tanggal', 'Tipe', 'Pihak / Nasabah', 'Detail', 'Berat', 'Kas 10%', 'Nominal']}
           emptyText="Tidak ada transaksi pada periode ini."
           rows={(data.transaksi || []).map((tx) => [
             fmtDate(tx.tanggal),
@@ -222,6 +263,11 @@ export default function LaporanPage({ data, api, setData, notify }) {
             <b>{tx.pihak}</b>,
             tx.kategori,
             Number(tx.berat || 0) > 0 ? fmtKg(tx.berat) : '-',
+            Number(tx.potongan_kas || 0) > 0 ? (
+              <span className="negative">{fmt(tx.potongan_kas)}</span>
+            ) : (
+              '-'
+            ),
             <b className={tx.tipe === 'Penarikan' ? 'negative' : 'positive'}>
               {fmt(tx.nominal)}
             </b>,

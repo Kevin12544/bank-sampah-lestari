@@ -331,6 +331,9 @@ export function ReceiptModal({ receipt, onClose }) {
 
         <div className="receipt-meta">
           <div><span>Tanggal</span><b>{fmtDate(receipt.tanggal)}</b></div>
+          {receipt.periode && (
+            <div><span>Periode Harga</span><b>{receipt.periode}</b></div>
+          )}
           <div><span>Nasabah</span><b>{receipt.nama_nasabah} ({receipt.no_buku})</b></div>
           <div><span>Petugas</span><b>{receipt.petugas}</b></div>
         </div>
@@ -342,7 +345,7 @@ export function ReceiptModal({ receipt, onClose }) {
                 <span>
                   {item.jenis_sampah} ({fmtKg(item.berat)} × {fmt(item.harga)})
                 </span>
-                <b>{fmt(item.nilai)}</b>
+                <b>{fmt(item.nilai_kotor ?? item.nilai)}</b>
               </div>
             ))}
           </div>
@@ -354,6 +357,12 @@ export function ReceiptModal({ receipt, onClose }) {
               <span>Jumlah Penarikan</span>
               <b>{fmt(receipt.jumlah)}</b>
             </div>
+            {receipt.is_penarikan_desember && (
+              <div className="receipt-row">
+                <span>Kebijakan</span>
+                <b>Pengecualian Akhir Tahun (Desember)</b>
+              </div>
+            )}
             {receipt.keterangan && (
               <div className="receipt-row">
                 <span>Keterangan</span>
@@ -364,9 +373,25 @@ export function ReceiptModal({ receipt, onClose }) {
         )}
 
         <div className="receipt-total">
+          {isSetoran && receipt.total_kotor !== undefined && (
+            <>
+              <div>
+                <span>Nilai Kotor Setoran (100%)</span>
+                <b>{fmt(receipt.total_kotor)}</b>
+              </div>
+              <div>
+                <span>Potongan Kas Operasional ({receipt.persen_potongan ?? 10}%)</span>
+                <b className="negative">- {fmt(receipt.total_potongan_kas ?? 0)}</b>
+              </div>
+            </>
+          )}
           <div>
-            <span>{isSetoran ? 'Total Setoran' : 'Total Ditarik'}</span>
-            <strong>{fmt(isSetoran ? receipt.total : receipt.jumlah)}</strong>
+            <span>
+              {isSetoran
+                ? `Masuk Saldo Nasabah (${100 - (receipt.persen_potongan ?? 10)}%)`
+                : 'Total Ditarik'}
+            </span>
+            <strong>{fmt(isSetoran ? (receipt.total_nasabah ?? receipt.total) : receipt.jumlah)}</strong>
           </div>
           <div>
             <span>Saldo Akhir Nasabah</span>

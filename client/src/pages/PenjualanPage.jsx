@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ShoppingCart,
   Building2,
@@ -8,6 +8,9 @@ import {
   RotateCcw,
   AlertTriangle,
   Package,
+  CalendarClock,
+  CheckCircle2,
+  Scale,
 } from 'lucide-react';
 import {
   Badge,
@@ -19,22 +22,66 @@ import {
 } from '../components/UI.jsx';
 import { dateNow, fmt, fmtDate, fmtKg } from '../utils/format.js';
 
+function createEmptyItem(jenis = '') {
+  return {
+    key: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    jenis_sampah: jenis,
+    berat_gudang: '',
+    berat_jual: '',
+    harga_jual: '',
+    manualBeratJual: false,
+  };
+}
+
+function calcScheduleClient(lastSaleDate, refDate, intervalDays = 14) {
+  if (!lastSaleDate || !refDate) {
+    return {
+      intervalDays,
+      lastSaleDate: null,
+      nextScheduleDate: refDate,
+      daysSinceLast: null,
+      daysRemaining: 0,
+      isDue: true,
+    };
+  }
+  const parse = (iso) => {
+    const [y, m, d] = iso.split('-').map(Number);
+    return Date.UTC(y, m - 1, d);
+  };
+  const dayMs = 86_400_000;
+  const lastMs = parse(lastSaleDate);
+  const refMs = parse(refDate);
+  const daysSinceLast = Math.floor((refMs - lastMs) / dayMs);
+  const nextScheduleDate = new Date(lastMs + intervalDays * dayMs)
+    .toISOString()
+    .slice(0, 10);
+  return {
+    intervalDays,
+    lastSaleDate,
+    nextScheduleDate,
+    daysSinceLast,
+    daysRemaining: Math.max(0, intervalDays - daysSinceLast),
+    isDue: daysSinceLast >= intervalDays,
+  };
+}
+
 export default function PenjualanPage({ data, api, notify, reload }) {
   const prices = data.prices || [];
   const collectors = data.collectors || [];
   const rows = data.rows || [];
 
-  const [form, setForm] = useState({
+  const [header, setHeader] = useState({
     id_pengepul: '',
-    jenis_sampah: '',
     tanggal: dateNow(),
-    berat_jual: '',
-    harga_jual: '',
     pembeli: '',
+    catatan: '',
+    diluar_jadwal: false,
   });
+
+  const [lineItems, setLineItems] = useState([]);
   const [saving, setSaving] = useState(false);
 
-  // Pengepul management modal
+  // Kelola Pengepul modal
   const [pengepulModal, setPengepulModal] = useState(false);
   const [editingPengepul, setEditingPengepul] = useState(null);
   const [pForm, setPForm] = useState({ nama: '', kontak: '', alamat: '' });
@@ -46,57 +93,202 @@ export default function PenjualanPage({ data, api, notify, reload }) {
   const [voidTarget, setVoidTarget] = useState(null);
   const [voiding, setVoiding] = useState(false);
 
+  // Inisialisasi baris item pertama saat daftar harga/stok tiba
   useEffect(() => {
-    if (!form.jenis_sampah && prices.length > 0) {
-      const withStock = prices.find((p) => Number(p.stok_kg || 0) > 0) || prices[0];
-      setForm((prev) => ({ ...prev, jenis_sampah: withStock.jenis_sampah }));
+    if (lineItems.length === 0 && prices.length > 0) {
+      const firstStock =
+        prices.find((p) => Number(p.stok_kg || 0) > 0) || prices[0];
+      setLineItems([createEmptyItem(firstStock.jenis_sampah)]);
     }
-  }, [prices, form.jenis_sampah]);
+  }, [prices, lineItems.length]);
 
-  const currentType = prices.find((p) => p.jenis_sampah === form.jenis_sampah);
-  const stokTersedia = Number(currentType?.stok_kg || 0);
-  const beratNum = Number(form.berat_jual || 0);
-  const hargaNum = Number(form.harga_jual || 0);
-  const overStock = beratNum > stokTersedia + 0.0005;
-  const totalEst = Math.round(beratNum * hargaNum * 100) / 100;
+  const priceByJenis = useMemo(
+    () => Object.fromEntries(prices.map((p) => [p.jenis_sampah, p])),
+    [prices]
+  );
+
+  // H4: Hitung status jadwal 2 mingguan berdasarkan penjualan terakhir & tanggal form
+  const lastSaleDate =
+    data.schedule?.lastSaleDate || (rows.length > 0 ? rows[0].tanggal : null);
+  const schedule = useMemo(
+    () => calcScheduleClient(lastSaleDate, header.tanggal, 14),
+    [lastSaleDate, header.tanggal]
+  );
+  const needsScheduleOverride = Boolean(schedule.lastSaleDate && !schedule.isDue);
+
+  // Hitung metrik per baris + validasi
+  const computedItems = lineItems.map((item) => {
+    const info = priceByJenis[item.jenis_sampah];
+    const stok = Number(info?.stok_kg || 0);
+    const bg = Number(item.berat_gudang || 0);
+    const bj = Number(item.berat_jual || 0);
+    const hj = Number(item.harga_jual || 0);
+    const susut = bg > 0 && bj > 0 && bg >= bj ? Math.round((bg - bj) * 1000) / 1000 : 0;
+    const susutPct = bg > 0 ? Math.round((susut / bg) * 1000) / 10 : 0;
+    const subtotal = Math.round(bj * hj * 100) / 100;
+
+    const overStock = bg > stok + 0.0005;
+    const sellExceedsWarehouse = bj > bg + 0.0005;
+
+    return {
+      ...item,
+      stok,
+      hargaBeli: Number(info?.harga_per_kg || 0),
+      bg,
+      bj,
+      hj,
+      susut,
+      susutPct,
+      subtotal,
+      overStock,
+      sellExceedsWarehouse,
+    };
+  });
+
+  const duplicateJenis = (() => {
+    const seen = new Set();
+    for (const item of computedItems) {
+      if (!item.jenis_sampah) continue;
+      if (seen.has(item.jenis_sampah)) return item.jenis_sampah;
+      seen.add(item.jenis_sampah);
+    }
+    return '';
+  })();
+
+  const totalGudang =
+    Math.round(computedItems.reduce((s, i) => s + i.bg, 0) * 1000) / 1000;
+  const totalJual =
+    Math.round(computedItems.reduce((s, i) => s + i.bj, 0) * 1000) / 1000;
+  const totalSusut =
+    Math.round(computedItems.reduce((s, i) => s + i.susut, 0) * 1000) / 1000;
+  const totalSusutPct =
+    totalGudang > 0 ? Math.round((totalSusut / totalGudang) * 1000) / 10 : 0;
+  const grandTotal =
+    Math.round(computedItems.reduce((s, i) => s + i.subtotal, 0) * 100) / 100;
+
+  const hasItemErrors =
+    Boolean(duplicateJenis) ||
+    computedItems.some((i) => i.overStock || i.sellExceedsWarehouse);
+
+  const scheduleBlocked =
+    needsScheduleOverride && (!header.diluar_jadwal || !header.catatan.trim());
+
+  function updateItem(key, patch) {
+    setLineItems((prev) =>
+      prev.map((row) => {
+        if (row.key !== key) return row;
+        const next = { ...row, ...patch };
+        // Jika user mengisi berat_gudang dan belum mengedit berat_jual manual, samakan dulu
+        if (
+          patch.berat_gudang !== undefined &&
+          !row.manualBeratJual &&
+          patch.berat_jual === undefined
+        ) {
+          next.berat_jual = patch.berat_gudang;
+        }
+        return next;
+      })
+    );
+  }
+
+  function addItemRow(preferredJenis = '') {
+    const used = new Set(lineItems.map((i) => i.jenis_sampah));
+    const nextType =
+      preferredJenis ||
+      prices.find((p) => !used.has(p.jenis_sampah) && Number(p.stok_kg || 0) > 0)
+        ?.jenis_sampah ||
+      prices.find((p) => !used.has(p.jenis_sampah))?.jenis_sampah ||
+      prices[0]?.jenis_sampah ||
+      '';
+
+    if (preferredJenis && used.has(preferredJenis)) {
+      notify(`"${preferredJenis}" sudah ada di daftar penjualan.`, 'info');
+      return;
+    }
+    setLineItems((prev) => [...prev, createEmptyItem(nextType)]);
+  }
+
+  function removeItemRow(key) {
+    setLineItems((prev) => (prev.length > 1 ? prev.filter((r) => r.key !== key) : prev));
+  }
 
   async function save(e) {
     e.preventDefault();
     if (saving) return;
 
-    if (!form.id_pengepul && !form.pembeli.trim()) {
+    if (!header.id_pengepul && !header.pembeli.trim()) {
       notify('Pilih pengepul terdaftar atau isi nama pembeli.', 'error');
       return;
     }
 
-    if (overStock) {
+    if (duplicateJenis) {
+      notify(`Jenis sampah "${duplicateJenis}" duplikat di daftar item.`, 'error');
+      return;
+    }
+
+    if (hasItemErrors) {
+      notify('Periksa kembali berat gudang dan berat timbangan pengepul pada tiap item.', 'error');
+      return;
+    }
+
+    if (scheduleBlocked) {
       notify(
-        `Stok ${form.jenis_sampah} hanya tersedia ${fmtKg(stokTersedia)}.`,
+        'Belum masuk siklus 2 mingguan. Centang opsi di luar jadwal dan isi alasan.',
         'error'
       );
       return;
     }
 
+    const validPayload = computedItems.filter((i) => i.bg > 0 && i.bj > 0 && i.hj > 0);
+    if (!validPayload.length) {
+      notify('Lengkapi minimal satu baris item penjualan.', 'error');
+      return;
+    }
+
     setSaving(true);
     try {
-      await api('/penjualan', {
+      const firstItem = validPayload[0];
+      const res = await api('/penjualan', {
         method: 'POST',
         body: JSON.stringify({
-          id_pengepul: form.id_pengepul ? Number(form.id_pengepul) : null,
-          jenis_sampah: form.jenis_sampah,
-          tanggal: form.tanggal,
-          berat_jual: beratNum,
-          harga_jual: hargaNum,
-          pembeli: form.pembeli.trim(),
+          id_pengepul: header.id_pengepul ? Number(header.id_pengepul) : null,
+          tanggal: header.tanggal,
+          pembeli: header.pembeli.trim(),
+          catatan: header.catatan.trim(),
+          diluar_jadwal: Boolean(header.diluar_jadwal),
+          ...(validPayload.length === 1
+            ? {
+                jenis_sampah: firstItem.jenis_sampah,
+                berat_gudang: firstItem.bg,
+                berat_jual: firstItem.bj,
+                harga_jual: firstItem.hj,
+              }
+            : {}),
+          items: validPayload.map((i) => ({
+            jenis_sampah: i.jenis_sampah,
+            berat_gudang: i.bg,
+            berat_jual: i.bj,
+            harga_jual: i.hj,
+          })),
         }),
       });
 
-      notify('Penjualan berhasil dicatat dan stok diperbarui.', 'success');
-      setForm((prev) => ({
+      notify(
+        `Penjualan berhasil dicatat (${validPayload.length} jenis · Susut: ${fmtKg(res.total_susut ?? totalSusut)}).`,
+        'success'
+      );
+      setHeader((prev) => ({
         ...prev,
-        berat_jual: '',
-        harga_jual: '',
+        catatan: '',
+        diluar_jadwal: false,
       }));
+      setLineItems([
+        createEmptyItem(
+          prices.find((p) => Number(p.stok_kg || 0) > 0)?.jenis_sampah ||
+            prices[0]?.jenis_sampah ||
+            ''
+        ),
+      ]);
       await reload();
     } catch (error) {
       notify(error.message, 'error');
@@ -157,9 +349,9 @@ export default function PenjualanPage({ data, api, notify, reload }) {
       const res = await api(`/penjualan/${voidTarget.id_penjualan}`, {
         method: 'DELETE',
       });
+      await reload();
       notify(res.message || 'Penjualan dibatalkan.', 'warning');
       setVoidTarget(null);
-      await reload();
     } catch (error) {
       notify(error.message, 'error');
     } finally {
@@ -171,7 +363,7 @@ export default function PenjualanPage({ data, api, notify, reload }) {
     <div className="page-enter">
       <Heading
         title="Penjualan ke Pengepul"
-        desc="Catat penjualan sampah berdasarkan stok gudang tersedia dan kelola mitra pengepul."
+        desc="Catat penjualan multi-jenis sampah (M:N), lacak pengurangan stok gudang, catat selisih berat susut, dan pantau siklus 2 mingguan."
         action={
           <button
             type="button"
@@ -187,25 +379,47 @@ export default function PenjualanPage({ data, api, notify, reload }) {
         }
       />
 
+      {/* H4: Status Siklus 2 Mingguan */}
       <Card>
-        <div className="card-title" style={{ marginBottom: 12 }}>
-          <div>
-            <h3>Stok Sampah Siap Jual</h3>
-            <p>Klik jenis sampah untuk langsung memilih di formulir penjualan</p>
+        <div className="card-title" style={{ marginBottom: 10, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div className={`stat-icon ${schedule.isDue ? 'green' : 'orange'}`} style={{ marginBottom: 0 }}>
+              <CalendarClock size={20} />
+            </div>
+            <div>
+              <h3>Siklus Penjualan Pengepul (Setiap 2 Minggu / 14 Hari)</h3>
+              <p>
+                {schedule.lastSaleDate
+                  ? `Penjualan terakhir: ${fmtDate(schedule.lastSaleDate)} (${schedule.daysSinceLast} hari lalu) · Jadwal berikutnya: ${fmtDate(schedule.nextScheduleDate)}`
+                  : 'Belum ada riwayat penjualan sebelumnya. Siap melaksanakan penjualan perdana.'}
+              </p>
+            </div>
           </div>
+
+          {schedule.isDue ? (
+            <Badge variant="green">
+              <CheckCircle2 size={12} /> Jadwal 2 Mingguan Siap / Jatuh Tempo
+            </Badge>
+          ) : (
+            <Badge variant="orange">
+              <CalendarClock size={12} /> {schedule.daysRemaining} hari menuju jadwal berikutnya
+            </Badge>
+          )}
         </div>
+
         <div className="stock-strip">
           {prices.map((item) => {
             const hasStock = Number(item.stok_kg || 0) > 0;
-            const active = form.jenis_sampah === item.jenis_sampah;
+            const selectedInList = lineItems.some(
+              (li) => li.jenis_sampah === item.jenis_sampah
+            );
             return (
               <button
                 type="button"
                 key={item.id_harga}
-                className={`stock-pill ${active ? 'active' : ''} ${hasStock ? '' : 'empty-stock'}`}
-                onClick={() =>
-                  setForm((prev) => ({ ...prev, jenis_sampah: item.jenis_sampah }))
-                }
+                className={`stock-pill ${selectedInList ? 'active' : ''} ${hasStock ? '' : 'empty-stock'}`}
+                onClick={() => addItemRow(item.jenis_sampah)}
+                title="Klik untuk menambah jenis sampah ini ke transaksi penjualan"
               >
                 <Package size={14} />
                 <span>{item.jenis_sampah}</span>
@@ -216,18 +430,28 @@ export default function PenjualanPage({ data, api, notify, reload }) {
         </div>
       </Card>
 
-      <div className="two-col">
+      <div className="transaction-layout">
         <Card>
           <form className="stack-form" onSubmit={save}>
-            <h3>Transaksi Penjualan</h3>
+            <div className="card-title" style={{ marginBottom: 2 }}>
+              <h3>Transaksi Penjualan Multi-Jenis (M:N)</h3>
+              <button
+                type="button"
+                className="secondary-btn"
+                style={{ padding: '7px 11px', fontSize: 11 }}
+                onClick={() => addItemRow('')}
+              >
+                <Plus size={14} /> Tambah Jenis Sampah
+              </button>
+            </div>
 
             <div className="form-grid">
               <label>
                 Pengepul Terdaftar
                 <select
-                  value={form.id_pengepul}
+                  value={header.id_pengepul}
                   onChange={(e) =>
-                    setForm({ ...form, id_pengepul: e.target.value })
+                    setHeader({ ...header, id_pengepul: e.target.value })
                   }
                 >
                   <option value="">-- Pilih pengepul (atau isi pembeli) --</option>
@@ -244,111 +468,219 @@ export default function PenjualanPage({ data, api, notify, reload }) {
                 <input
                   type="date"
                   required
-                  value={form.tanggal}
-                  onChange={(e) => setForm({ ...form, tanggal: e.target.value })}
+                  value={header.tanggal}
+                  onChange={(e) =>
+                    setHeader({ ...header, tanggal: e.target.value })
+                  }
                 />
               </label>
             </div>
 
             <label>
-              Jenis Sampah *
-              <select
-                value={form.jenis_sampah}
-                onChange={(e) =>
-                  setForm({ ...form, jenis_sampah: e.target.value })
-                }
-                required
-              >
-                {prices.map((item) => (
-                  <option key={item.id_harga} value={item.jenis_sampah}>
-                    {item.jenis_sampah} — Stok: {fmtKg(item.stok_kg || 0)}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <div className="balance-hint">
-              <span>Stok {form.jenis_sampah || '-'} tersedia</span>
-              <b>{fmtKg(stokTersedia)}</b>
-            </div>
-
-            <div className="form-grid">
-              <label>
-                Berat yang Dijual (kg) *
-                <input
-                  type="number"
-                  min="0.001"
-                  step="any"
-                  max={stokTersedia > 0 ? stokTersedia : undefined}
-                  required
-                  value={form.berat_jual}
-                  onChange={(e) =>
-                    setForm({ ...form, berat_jual: e.target.value })
-                  }
-                  placeholder="0.0"
-                />
-              </label>
-
-              <label>
-                Harga Jual per kg (Rp) *
-                <input
-                  type="number"
-                  min="1"
-                  step="any"
-                  required
-                  value={form.harga_jual}
-                  onChange={(e) =>
-                    setForm({ ...form, harga_jual: e.target.value })
-                  }
-                  placeholder={
-                    currentType
-                      ? `Harga beli: ${fmt(currentType.harga_per_kg)}`
-                      : 'Rp'
-                  }
-                />
-              </label>
-            </div>
-
-            {stokTersedia > 0 && (
-              <div className="quick-chips">
-                <button
-                  type="button"
-                  className="chip-btn"
-                  onClick={() =>
-                    setForm({ ...form, berat_jual: String(stokTersedia) })
-                  }
-                >
-                  Jual Semua Stok ({fmtKg(stokTersedia)})
-                </button>
-              </div>
-            )}
-
-            {overStock && (
-              <div className="inline-error">
-                <AlertTriangle size={15} />
-                <span>
-                  Berat jual melebihi stok gudang ({fmtKg(stokTersedia)}).
-                </span>
-              </div>
-            )}
-
-            <label>
-              Nama Pembeli {form.id_pengepul ? '(opsional)' : '*'}
+              Nama Pembeli {header.id_pengepul ? '(opsional)' : '*'}
               <input
                 maxLength={120}
-                required={!form.id_pengepul}
-                value={form.pembeli}
-                onChange={(e) => setForm({ ...form, pembeli: e.target.value })}
+                required={!header.id_pengepul}
+                value={header.pembeli}
+                onChange={(e) =>
+                  setHeader({ ...header, pembeli: e.target.value })
+                }
                 placeholder="Isi jika pembeli tidak ada di daftar pengepul"
+              />
+            </label>
+
+            {duplicateJenis && (
+              <div className="inline-error">
+                <AlertTriangle size={15} />
+                <span>Jenis sampah "{duplicateJenis}" duplikat. Gabungkan dalam satu baris.</span>
+              </div>
+            )}
+
+            <div className="sale-items-list">
+              {computedItems.map((item, idx) => (
+                <div className="sale-item-box" key={item.key}>
+                  <div className="sale-item-head">
+                    <b>Item #{idx + 1}</b>
+                    <div className="action-row">
+                      <Badge variant={item.stok > 0 ? 'green' : 'muted'}>
+                        Stok gudang: {fmtKg(item.stok)}
+                      </Badge>
+                      {item.stok > 0 && (
+                        <button
+                          type="button"
+                          className="chip-btn"
+                          style={{ padding: '4px 9px', fontSize: 10.5 }}
+                          onClick={() =>
+                            updateItem(item.key, {
+                              berat_gudang: String(item.stok),
+                              berat_jual: String(item.stok),
+                              manualBeratJual: false,
+                            })
+                          }
+                        >
+                          Ambil Semua ({fmtKg(item.stok)})
+                        </button>
+                      )}
+                      {lineItems.length > 1 && (
+                        <button
+                          type="button"
+                          className="icon-action danger"
+                          title="Hapus baris"
+                          onClick={() => removeItemRow(item.key)}
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="form-grid" style={{ marginTop: 10 }}>
+                    <label>
+                      Jenis Sampah *
+                      <select
+                        required
+                        value={item.jenis_sampah}
+                        onChange={(e) =>
+                          updateItem(item.key, {
+                            jenis_sampah: e.target.value,
+                            berat_gudang: '',
+                            berat_jual: '',
+                            manualBeratJual: false,
+                          })
+                        }
+                      >
+                        {prices.map((p) => (
+                          <option key={p.id_harga} value={p.jenis_sampah}>
+                            {p.jenis_sampah} — Stok: {fmtKg(p.stok_kg || 0)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label>
+                      Harga Jual per kg (Rp) *
+                      <input
+                        type="number"
+                        min="1"
+                        step="any"
+                        required
+                        value={item.harga_jual}
+                        onChange={(e) =>
+                          updateItem(item.key, { harga_jual: e.target.value })
+                        }
+                        placeholder={`Harga beli: ${fmt(item.hargaBeli)}`}
+                      />
+                    </label>
+
+                    <label>
+                      Berat Keluar Gudang (kg) *
+                      <input
+                        type="number"
+                        min="0.001"
+                        step="any"
+                        required
+                        value={item.berat_gudang}
+                        onChange={(e) =>
+                          updateItem(item.key, { berat_gudang: e.target.value })
+                        }
+                        placeholder="Berat stok keluar gudang"
+                      />
+                    </label>
+
+                    <label>
+                      Berat Timbangan Pengepul (kg) *
+                      <input
+                        type="number"
+                        min="0.001"
+                        step="any"
+                        required
+                        value={item.berat_jual}
+                        onChange={(e) =>
+                          updateItem(item.key, {
+                            berat_jual: e.target.value,
+                            manualBeratJual: true,
+                          })
+                        }
+                        placeholder="Berat bersih dibayar pengepul"
+                      />
+                    </label>
+                  </div>
+
+                  <div className="sale-item-foot">
+                    <span>
+                      <Scale size={13} style={{ verticalAlign: 'middle', marginRight: 4 }} />
+                      Susut:{' '}
+                      <b className={item.susut > 0 ? 'negative' : ''}>
+                        {fmtKg(item.susut)} ({item.susutPct}%)
+                      </b>
+                    </span>
+                    <span>
+                      Subtotal: <b className="positive">{fmt(item.subtotal)}</b>
+                    </span>
+                  </div>
+
+                  {item.overStock && (
+                    <div className="inline-error">
+                      <AlertTriangle size={14} />
+                      <span>
+                        Berat keluar gudang ({fmtKg(item.bg)}) melebihi stok gudang ({fmtKg(item.stok)}).
+                      </span>
+                    </div>
+                  )}
+
+                  {item.sellExceedsWarehouse && (
+                    <div className="inline-error">
+                      <AlertTriangle size={14} />
+                      <span>
+                        Berat timbangan pengepul ({fmtKg(item.bj)}) tidak boleh melebihi berat keluar gudang ({fmtKg(item.bg)}).
+                      </span>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {needsScheduleOverride && (
+              <div className="account-toggle-box" style={{ borderColor: '#efc784', background: '#fffaf0' }}>
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={header.diluar_jadwal}
+                    onChange={(e) =>
+                      setHeader({ ...header, diluar_jadwal: e.target.checked })
+                    }
+                  />
+                  <span>
+                    <b>Penjualan di luar jadwal 2 mingguan (mendesak)</b>
+                    <small>
+                      Penjualan terakhir baru {schedule.daysSinceLast} hari lalu (jadwal 14 hari pada {fmtDate(schedule.nextScheduleDate)}). Centang &amp; isi alasan jika gudang penuh atau mendesak.
+                    </small>
+                  </span>
+                </label>
+              </div>
+            )}
+
+            <label>
+              Catatan / Alasan {needsScheduleOverride ? '(wajib jika di luar jadwal 2 minggu)' : '(opsional)'}
+              <input
+                maxLength={300}
+                required={needsScheduleOverride && header.diluar_jadwal}
+                value={header.catatan}
+                onChange={(e) =>
+                  setHeader({ ...header, catatan: e.target.value })
+                }
+                placeholder="Contoh: Gudang plastik penuh / catatan susut kelembapan"
               />
             </label>
 
             <button
               className="primary full"
-              disabled={saving || overStock || stokTersedia <= 0}
+              disabled={saving || hasItemErrors || scheduleBlocked}
             >
               <ShoppingCart size={16} />
-              {saving ? 'Menyimpan...' : 'Simpan Penjualan'}
+              {saving
+                ? 'Menyimpan Penjualan...'
+                : `Simpan Penjualan (${computedItems.length} Jenis)`}
             </button>
           </form>
         </Card>
@@ -358,37 +690,37 @@ export default function PenjualanPage({ data, api, notify, reload }) {
             <ShoppingCart size={22} />
           </div>
 
-          <h3>Perkiraan Total Penjualan</h3>
-          <strong>{fmt(totalEst)}</strong>
-          <p>
-            {fmtKg(beratNum)} × {fmt(hargaNum)}/kg
-          </p>
+          <h3>Ringkasan Penjualan</h3>
+          <p>Total pendapatan dari {computedItems.length} jenis sampah</p>
+          <strong>{fmt(grandTotal)}</strong>
 
-          {currentType && hargaNum > 0 && beratNum > 0 && (
-            <div className="summary-projected">
-              <span>Estimasi margin vs harga beli</span>
-              <b
-                className={
-                  hargaNum >= Number(currentType.harga_per_kg)
-                    ? 'positive'
-                    : 'negative'
-                }
-              >
-                {fmt((hargaNum - Number(currentType.harga_per_kg)) * beratNum)}
+          <div className="summary-breakdown">
+            <div>
+              <span>Total Keluar Gudang</span>
+              <b>{fmtKg(totalGudang)}</b>
+            </div>
+            <div>
+              <span>Total Timbangan Pengepul</span>
+              <b>{fmtKg(totalJual)}</b>
+            </div>
+            <div>
+              <span>Selisih Berat (Susut)</span>
+              <b className={totalSusut > 0 ? 'negative' : 'positive'}>
+                {fmtKg(totalSusut)} ({totalSusutPct}%)
               </b>
             </div>
-          )}
+          </div>
 
           <div className="summary-note">
-            Sistem memvalidasi ketersediaan stok di server menggunakan kunci transaksi sehingga stok tidak mungkin minus.
+            Stok gudang dikurangi sebesar <b>Berat Keluar Gudang</b> per jenis sampah, sedangkan pendapatan dihitung dari <b>Berat Timbangan Pengepul × Harga Jual</b>. Selisihnya dicatat permanen sebagai <b>Susut</b>.
           </div>
         </Card>
       </div>
 
-      <Card>
+      <Card style={{ marginTop: 18 }}>
         <div className="table-toolbar">
           <h3>
-            Riwayat Penjualan <span className="count">{rows.length}</span>
+            Riwayat Penjualan Multi-Item <span className="count">{rows.length}</span>
           </h3>
         </div>
 
@@ -396,30 +728,59 @@ export default function PenjualanPage({ data, api, notify, reload }) {
           pageSize={10}
           headers={[
             'Tanggal',
-            'Jenis Sampah',
-            'Berat',
-            'Harga/kg',
+            'Rincian Jenis (M:N)',
+            'Keluar Gudang',
+            'Timbang Pengepul',
+            'Susut',
             'Total',
-            'Pengepul / Pembeli',
+            'Pengepul & Jadwal',
             'Aksi',
           ]}
           emptyText="Belum ada riwayat penjualan."
-          rows={rows.map((item) => [
-            fmtDate(item.tanggal),
-            <Badge variant="blue">{item.jenis_sampah}</Badge>,
-            fmtKg(item.berat_jual),
-            fmt(item.harga_jual),
-            <b className="positive">{fmt(item.total)}</b>,
-            item.nama_pengepul || item.pembeli || '-',
-            <button
-              type="button"
-              className="icon-action danger"
-              title="Batalkan (void) penjualan"
-              onClick={() => setVoidTarget(item)}
-            >
-              <RotateCcw size={14} />
-            </button>,
-          ])}
+          rows={rows.map((item) => {
+            const detailList = item.items || [];
+            return [
+              fmtDate(item.tanggal),
+              <div style={{ display: 'grid', gap: 4 }}>
+                {detailList.length > 0 ? (
+                  detailList.map((d) => (
+                    <div key={d.id_detail || d.jenis_sampah} style={{ fontSize: 11.5 }}>
+                      <Badge variant="blue">{d.jenis_sampah}</Badge>{' '}
+                      <span>
+                        {fmtKg(d.berat_gudang)} → {fmtKg(d.berat_jual)}
+                        {Number(d.berat_susut || 0) > 0 && (
+                          <span className="negative"> (susut {fmtKg(d.berat_susut)})</span>
+                        )}
+                      </span>
+                    </div>
+                  ))
+                ) : (
+                  <Badge variant="blue">{item.jenis_sampah}</Badge>
+                )}
+              </div>,
+              fmtKg(item.total_berat_gudang || item.berat_jual),
+              fmtKg(item.berat_jual),
+              <b className={Number(item.total_susut || 0) > 0 ? 'negative' : ''}>
+                {fmtKg(item.total_susut || 0)}
+              </b>,
+              <b className="positive">{fmt(item.total)}</b>,
+              <div>
+                <b>{item.nama_pengepul || item.pembeli || '-'}</b>
+                <small className="cell-sub">
+                  {item.diluar_jadwal ? 'Di luar jadwal 2 minggu' : 'Sesuai siklus 2 minggu'}
+                  {item.catatan ? ` · ${item.catatan}` : ''}
+                </small>
+              </div>,
+              <button
+                type="button"
+                className="icon-action danger"
+                title="Batalkan (void) penjualan"
+                onClick={() => setVoidTarget(item)}
+              >
+                <RotateCcw size={14} />
+              </button>,
+            ];
+          })}
         />
       </Card>
 
@@ -536,7 +897,7 @@ export default function PenjualanPage({ data, api, notify, reload }) {
       <ConfirmDialog
         open={Boolean(voidTarget)}
         title="Batalkan Transaksi Penjualan"
-        message={`Batalkan penjualan ${fmtKg(voidTarget?.berat_jual)} ${voidTarget?.jenis_sampah} senilai ${fmt(voidTarget?.total)}? Stok sampah akan dikembalikan ke gudang.`}
+        message={`Batalkan penjualan #${voidTarget?.id_penjualan} (${voidTarget?.jenis_sampah}, keluar gudang ${fmtKg(voidTarget?.total_berat_gudang || voidTarget?.berat_jual)}, senilai ${fmt(voidTarget?.total)})? Stok gudang semua jenis pada transaksi ini akan dikembalikan.`}
         confirmLabel="Ya, Batalkan Penjualan"
         danger
         busy={voiding}

@@ -10,12 +10,7 @@ import {
   Leaf,
 } from 'lucide-react';
 
-const DEMO_ACCOUNTS = [
-  { role: 'Ketua', username: 'ketua', password: 'lestari' },
-  { role: 'Bendahara', username: 'bendahara', password: 'lestari' },
-  { role: 'Petugas Timbang', username: 'petugas', password: 'lestari' },
-  { role: 'Nasabah', username: 'nasabah', password: 'lestari' },
-];
+const SHOW_DEMO_HINT = import.meta.env.VITE_SHOW_DEMO_HINT === 'true';
 
 export default function LoginPage({ onLogin, busy, error, onClearError }) {
   const [username, setUsername] = useState('');
@@ -129,27 +124,12 @@ export default function LoginPage({ onLogin, busy, error, onClearError }) {
           )}
         </button>
 
-        <div className="demo-accounts">
-          <b>Account / Password</b>
-          <div className="demo-account-list">
-            {DEMO_ACCOUNTS.map((acc) => (
-              <button
-                type="button"
-                key={acc.username}
-                className="demo-account-row"
-                onClick={() => {
-                  setUsername(acc.username);
-                  setPassword(acc.password);
-                  if (error) onClearError?.();
-                }}
-                title={`Isi otomatis akun ${acc.role}`}
-              >
-                <code>{acc.username} : {acc.password}</code>
-                <span>{acc.role}</span>
-              </button>
-            ))}
+        {SHOW_DEMO_HINT && (
+          <div className="demo-accounts">
+            <b>Mode Uji Coba Aktif</b>
+            <span>Gunakan akun uji sesuai panduan administrator.</span>
           </div>
-        </div>
+        )}
 
         <div className="login-security-note">
           <ShieldCheck size={14} />

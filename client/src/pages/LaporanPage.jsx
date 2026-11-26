@@ -67,7 +67,14 @@ export default function LaporanPage({ data, api, setData, notify }) {
   }
 
   const periodTitle = `${MONTH_NAMES[(data.month || month) - 1] || ''} ${data.year || year}`;
-  const kasOps = data.kasOperasionalPeriode ?? data.setor?.potonganKas ?? 0;
+  const isLegacyReport = data.kasOperasionalPeriode === undefined && data.setor?.potonganKas === undefined;
+  const setorKotor = Number(data.setor?.totalKotor ?? data.setor?.total ?? 0);
+  const kasOps = isLegacyReport
+    ? Math.round(setorKotor * 0.1 * 100) / 100
+    : Number(data.kasOperasionalPeriode ?? data.setor?.potonganKas ?? 0);
+  const setorNasabah = isLegacyReport
+    ? Math.round((setorKotor - kasOps) * 100) / 100
+    : Number(data.setor?.totalNasabah ?? data.setor?.total ?? 0);
 
   return (
     <div className="page-enter">
@@ -143,14 +150,18 @@ export default function LaporanPage({ data, api, setData, notify }) {
           <div>
             <small>Kas Operasional (Potongan 10%)</small>
             <b className="positive">{fmt(kasOps)}</b>
-            <span>sumber utama kas operasional bank sampah</span>
+            <span>
+              {isLegacyReport
+                ? 'estimasi 10% setoran (mode v2.1.1)'
+                : 'sumber utama kas operasional bank sampah'}
+            </span>
           </div>
 
           <div>
             <small>Total Setoran ({data.setor?.jumlah_transaksi || 0} trx)</small>
-            <b>{fmt(data.setor?.totalKotor ?? data.setor?.total)}</b>
+            <b>{fmt(setorKotor)}</b>
             <span>
-              {fmtKg(data.setor?.berat || 0)} · Hak Nasabah 90%: {fmt(data.setor?.totalNasabah ?? data.setor?.total)}
+              {fmtKg(data.setor?.berat || 0)} · Hak Nasabah 90%: {fmt(setorNasabah)}
             </span>
           </div>
 
@@ -190,13 +201,24 @@ export default function LaporanPage({ data, api, setData, notify }) {
               pageSize={0}
               headers={['Jenis', 'Berat', 'Kotor (100%)', 'Kas (10%)', 'Nasabah (90%)']}
               emptyText="Tidak ada setoran pada periode ini."
-              rows={(data.detail || []).map((item) => [
-                <b>{item.jenis}</b>,
-                fmtKg(item.berat),
-                fmt(item.kotor ?? item.total),
-                <span className="negative">{fmt(item.potongan_kas ?? 0)}</span>,
-                <b className="positive">{fmt(item.total)}</b>,
-              ])}
+              rows={(data.detail || []).map((item) => {
+                const kotor = Number(item.kotor ?? item.total ?? 0);
+                const pot =
+                  item.potongan_kas !== undefined
+                    ? Number(item.potongan_kas)
+                    : Math.round(kotor * 0.1 * 100) / 100;
+                const net =
+                  item.kotor !== undefined
+                    ? Number(item.total || 0)
+                    : Math.round((kotor - pot) * 100) / 100;
+                return [
+                  <b>{item.jenis}</b>,
+                  fmtKg(item.berat),
+                  fmt(kotor),
+                  <span className="negative">{fmt(pot)}</span>,
+                  <b className="positive">{fmt(net)}</b>,
+                ];
+              })}
             />
           </div>
 

@@ -77,6 +77,21 @@ export default function App() {
   const loadRequestRef = useRef(0);
   const toastIdRef = useRef(0);
   const profileRef = useRef(null);
+  const backendCapsRef = useRef({ checked: false, supportsH1H4: true, version: '' });
+
+  const detectBackendCaps = useCallback(async () => {
+    if (backendCapsRef.current.checked) return backendCapsRef.current;
+    try {
+      const h = await apiRequest('/health');
+      const v = String(h?.version || '');
+      const m = v.match(/^(\d+)\.(\d+)/);
+      const supportsH1H4 = m ? Number(m[1]) > 2 || (Number(m[1]) === 2 && Number(m[2]) >= 2) : true;
+      backendCapsRef.current = { checked: true, supportsH1H4, version: v };
+    } catch {
+      backendCapsRef.current = { checked: true, supportsH1H4: true, version: '' };
+    }
+    return backendCapsRef.current;
+  }, []);
 
   const dismissToast = useCallback((id) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -188,10 +203,23 @@ export default function App() {
       } else if (page === 'nasabah') {
         result = { rows: await api('/nasabah') };
       } else if (page === 'harga') {
-        try {
-          result = await api('/harga-periode');
-        } catch {
-          result = { rows: await api('/harga'), legacyMode: true };
+        const caps = await detectBackendCaps();
+        if (!caps.supportsH1H4) {
+          result = {
+            rows: await api('/harga'),
+            legacyMode: true,
+            backendVersion: caps.version,
+          };
+        } else {
+          try {
+            result = await api('/harga-periode');
+          } catch {
+            result = {
+              rows: await api('/harga'),
+              legacyMode: true,
+              backendVersion: caps.version,
+            };
+          }
         }
       } else if (page === 'setoran') {
         result = await api('/page/setoran');
@@ -227,7 +255,7 @@ export default function App() {
         setLoadingPage(false);
       }
     }
-  }, [token, userRole, userId, page, api, notify]);
+  }, [token, userRole, userId, page, api, notify, detectBackendCaps]);
 
   useEffect(() => {
     load();

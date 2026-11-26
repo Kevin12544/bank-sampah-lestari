@@ -44,13 +44,14 @@ export default function HargaPage({ data, setData, api, notify, reload }) {
 
   const rows = data.rows || [];
   const historyPeriods = data.historyPeriods || [];
+  const isLegacy = Boolean(data.legacyMode);
   const isLocked = Boolean(data.isLocked);
   const hasTransactions = Boolean(data.hasTransactions);
   const isPastPeriod = Boolean(data.isPastPeriod);
   const periodLabel = `${MONTH_NAMES[(data.month || month) - 1] || ''} ${data.year || year}`;
 
   async function loadPeriod(targetMonth, targetYear) {
-    if (loadingPeriod) return;
+    if (loadingPeriod || isLegacy) return;
     setLoadingPeriod(true);
     try {
       const res = await api(`/harga-periode?month=${targetMonth}&year=${targetYear}`);
@@ -66,6 +67,7 @@ export default function HargaPage({ data, setData, api, notify, reload }) {
   }
 
   function goToNextMonth() {
+    if (isLegacy) return;
     const nextM = now.month === 12 ? 1 : now.month + 1;
     const nextY = now.month === 12 ? now.year + 1 : now.year;
     loadPeriod(nextM, nextY);
@@ -92,6 +94,24 @@ export default function HargaPage({ data, setData, api, notify, reload }) {
 
     setSavingBatch(true);
     try {
+      if (isLegacy) {
+        const changed = rows.filter(
+          (item) =>
+            values[item.id_harga] !== undefined &&
+            Number(values[item.id_harga]) !== Number(item.harga_per_kg)
+        );
+        for (const item of changed) {
+          await api(`/harga/${item.id_harga}`, {
+            method: 'PUT',
+            body: JSON.stringify({ harga_per_kg: Number(values[item.id_harga]) }),
+          });
+        }
+        setValues({});
+        notify('Perubahan harga berhasil disimpan.', 'success');
+        await reload();
+        return;
+      }
+
       const res = await api('/harga-periode', {
         method: 'PUT',
         body: JSON.stringify({
@@ -175,7 +195,8 @@ export default function HargaPage({ data, setData, api, notify, reload }) {
               type="button"
               className="secondary-btn"
               onClick={goToNextMonth}
-              disabled={loadingPeriod}
+              disabled={loadingPeriod || isLegacy}
+              title={isLegacy ? 'Aktif otomatis setelah backend v2.2.0 di-deploy' : undefined}
             >
               <Calendar size={15} /> Siapkan Awal Bulan Depan
             </button>
@@ -217,13 +238,18 @@ export default function HargaPage({ data, setData, api, notify, reload }) {
             type="button"
             className="secondary-btn"
             onClick={() => loadPeriod(month, year)}
-            disabled={loadingPeriod}
+            disabled={loadingPeriod || isLegacy}
+            title={isLegacy ? 'Aktif otomatis setelah backend v2.2.0 di-deploy' : undefined}
           >
             {loadingPeriod ? 'Memuat...' : 'Tampilkan Periode'}
           </button>
 
           <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
-            {isLocked ? (
+            {isLegacy ? (
+              <Badge variant="blue">
+                <Calendar size={12} /> Mode Kompatibilitas (Backend v{data.backendVersion || '2.1.1'})
+              </Badge>
+            ) : isLocked ? (
               <Badge variant="orange">
                 <Lock size={12} /> Periode Terkunci ({periodLabel})
               </Badge>
@@ -235,7 +261,21 @@ export default function HargaPage({ data, setData, api, notify, reload }) {
           </div>
         </div>
 
-        {isLocked ? (
+        {isLegacy ? (
+          <div className="balance-hint" style={{ marginBottom: 16 }}>
+            <span>
+              Backend sedang berjalan di <b>v{data.backendVersion || '2.1.1'}</b>. Tarif master ditampilkan normal; fitur penetapan &amp; penguncian <b>HargaPeriode</b> bulanan otomatis aktif setelah backend <b>v2.2.0</b> di-deploy.
+            </span>
+            <button
+              type="button"
+              className="small-primary"
+              disabled={savingBatch || !hasDirty}
+              onClick={() => savePeriodPrices(false)}
+            >
+              <Save size={14} /> Simpan Perubahan
+            </button>
+          </div>
+        ) : isLocked ? (
           <div className="security-banner" style={{ marginBottom: 16 }}>
             <AlertTriangle size={18} />
             <div>

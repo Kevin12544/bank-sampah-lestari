@@ -18,8 +18,34 @@ export default function DashboardPage({ data, user, setPage }) {
   const role = user?.role;
   const isManager = role === 'Ketua' || role === 'Bendahara';
 
-  const kasOperasional = Number(data.kasOperasional ?? data.saldoKas ?? 0);
+  const isLegacy = data.kasOperasional === undefined;
   const persenPotongan = Number(data.potonganKasPersen ?? 10);
+  const setorKotor = Number(data.setorKotor ?? data.setor ?? 0);
+  const kasOperasional = isLegacy
+    ? Math.round(setorKotor * (persenPotongan / 100) * 100) / 100
+    : Number(data.kasOperasional || 0);
+  const hakNasabahSetor = isLegacy
+    ? Math.round((setorKotor - kasOperasional) * 100) / 100
+    : Number(data.setor || 0);
+  const arusKasPenjualan = Number(data.arusKasPenjualan ?? data.saldoKas ?? 0);
+
+  const schedule = (() => {
+    if (data.schedule) return data.schedule;
+    const lastSale = (data.recent || []).find((r) => r.tipe === 'Penjualan');
+    if (!lastSale?.tanggal) return null;
+    const [ly, lm, ld] = String(lastSale.tanggal).split('-').map(Number);
+    const nowStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Makassar' }).format(new Date());
+    const [ny, nm, nd] = nowStr.split('-').map(Number);
+    const dayMs = 86_400_000;
+    const lastMs = Date.UTC(ly, lm - 1, ld);
+    const nowMs = Date.UTC(ny, nm - 1, nd);
+    const daysSinceLast = Math.floor((nowMs - lastMs) / dayMs);
+    return {
+      isDue: daysSinceLast >= 14,
+      daysRemaining: Math.max(0, 14 - daysSinceLast),
+      nextScheduleDate: new Date(lastMs + 14 * dayMs).toISOString().slice(0, 10),
+    };
+  })();
 
   const cards = [
     {
@@ -34,7 +60,9 @@ export default function DashboardPage({ data, user, setPage }) {
       label: `Kas Operasional (${persenPotongan}%)`,
       raw: kasOperasional,
       formatter: (v) => fmt(v),
-      sub: `potongan ${persenPotongan}% dari setoran`,
+      sub: isLegacy
+        ? `estimasi ${persenPotongan}% dari setoran`
+        : `potongan ${persenPotongan}% dari setoran`,
       Icon: Wallet,
       color: 'purple',
     },
@@ -119,9 +147,9 @@ export default function DashboardPage({ data, user, setPage }) {
       <div className="mini-metrics">
         <div>
           <span>Nilai Setoran (100% Kotor)</span>
-          <b>{fmt(data.setorKotor ?? data.setor)}</b>
+          <b>{fmt(setorKotor)}</b>
           <small>
-            {fmtKg(data.beratSetor)} · Hak 90%: {fmt(data.setor)}
+            {fmtKg(data.beratSetor)} · Hak 90%: {fmt(hakNasabahSetor)}
           </small>
         </div>
         <div>
@@ -134,18 +162,18 @@ export default function DashboardPage({ data, user, setPage }) {
         <div>
           <span>Total Penarikan Nasabah</span>
           <b>{fmt(data.penarikan)}</b>
-          <small>Arus jual − tarik: {fmt(data.arusKasPenjualan ?? 0)}</small>
+          <small>Arus jual − tarik: {fmt(arusKasPenjualan)}</small>
         </div>
         <div>
           <span>Siklus Jual 2 Mingguan</span>
-          <b className={data.schedule?.isDue !== false ? 'positive' : ''}>
-            {data.schedule?.isDue !== false
+          <b className={schedule?.isDue !== false ? 'positive' : ''}>
+            {schedule?.isDue !== false
               ? 'Siap Dijual'
-              : `${data.schedule.daysRemaining} hari lagi`}
+              : `${schedule.daysRemaining} hari lagi`}
           </b>
           <small>
-            {data.schedule?.nextScheduleDate
-              ? `Jadwal: ${fmtDate(data.schedule.nextScheduleDate)}`
+            {schedule?.nextScheduleDate
+              ? `Jadwal: ${fmtDate(schedule.nextScheduleDate)}`
               : 'Siklus 14 hari pengepul'}
           </small>
         </div>

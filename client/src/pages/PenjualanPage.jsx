@@ -245,6 +245,14 @@ export default function PenjualanPage({ data, api, notify, reload }) {
       return;
     }
 
+    if (data.schedule === undefined && validPayload.length > 1) {
+      notify(
+        'Transaksi multi-jenis (M:N) & pencatatan susut memerlukan backend v2.2.0. Saat ini server masih berjalan di v2.1.1 — simpan 1 jenis per transaksi sementara atau deploy backend v2.2.0.',
+        'warning'
+      );
+      return;
+    }
+
     setSaving(true);
     try {
       const firstItem = validPayload[0];
